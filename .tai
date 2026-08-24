@@ -1,3 +1,6 @@
 {
-	"provider": "llama_cpp"
+	"provider": "mistral",
+	"model": "mistral-small-latest",
+	"tpm": 50000,
+	"rpm": 30
 }

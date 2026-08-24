@@ -1,6 +1,7 @@
 local M = {}
 local log = require('tai.log')
 local tools_io = require("tai.tools.io")
+local config = require("tai.config")
 
 -- Export limit_output from io module
 M.limit_output = tools_io.limit_output
@@ -16,7 +17,6 @@ function M.unsafe_command(cmd)
 		return "[sys] Redirects (>, <, >>, <<, 2>/dev/null, etc.) are not allowed. Stderr is already captured; omit redirects."
 	end
 
-	local config = require("tai.config")
 	local allowed = config.get_allowed_commands()
 
 	-- Extract the base command (first word). Paths like /usr/bin/ssh use basename.

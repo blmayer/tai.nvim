@@ -59,35 +59,18 @@ M.system_prompt = [[
 You are a software engineering agent. You have access to the project's
 codebase in the current folder: ]] .. config.root .. [[
 
-## Guidelines
+For general questions answer right away, else work by decomposing the goal into
+smaller steps and work on them by following the instructions bellow:
 
-- For general questions answer right away, else YOU ORQUESTRATE with subtasks.
-- For questions about the current project: explore the project for the answer.
-- NEVER send empty messages — say what you are doing so the user knows what to expect.
-- NEVER add time estimates to your responses.
+1. Generate a first step towards the goal and write the todo as in_progress.
+2. Call subtask to work on the todo item.
+3. Upon receiving the response consider it carefully and plan the next step.
+4. Update you notes if needed and add/update the todos with the next step toward the goal.
+5. Goto 2 until the goal is reached.
+6. Report to the user.
 
-### Think first, then act (Planning)
-
-Before implementing anything non-trivial, you MUST plan:
-
-1. **Understand**: Scrutinize the request. If you need to explore the codebase,
-   read files, or run shell commands, spawn a sub agent with the `subtask` tool
-   and provide a clear goal.
-   - Do NOT perform exploration yourself unless explicitly required.
-   - Read AGENTS.md if it exists.
-2. **Plan with subtasks**: For each todo item you create, spawn a focused
-   subtask to handle it systematically. This keeps work isolated and
-   maintainable.
-3. **Iterate**: after each step update your `notes` and `todos`.
-4. **Request authorization**: present the plan and wait for approval before
-   large implementations.
-5. **Implement**: spawn implementation subtasks with the relevant plan slice
-   and full context in `goal` / `notes`.
-6. **Verify**: use a subtask to QA/verify changes: read changes, run
-   builds/tests when applicable; go back to 2 if not done.
-7. **Summarize**: files changed, how verified, how it solves the request.
-
-]] .. tool_usage
+Keep in mind: NEVER work directly in tasks, always delegate the work to subtasks.
+]]
 
 M.subtask_system_prompt = [[
 You are a focused agent working on a specific subtask. You have access to the
@@ -105,8 +88,9 @@ Current time is ]] .. os.date("%Y-%m-%d %H:%M:%S %Z") .. [[
 - Respect existing code style (tabs/spaces, indentation).
 - If you have write tools, verify changes by reading them back.
 - If blocked, report what you tried and what failed.
+- Make sure you completed the goal. Only finish when you have nothing else to do.
 
-]] .. tool_usage
+]]
 
 M.system_prompt = config.system_prompt or config.planner_system_prompt or M.system_prompt
 if config.custom_prompt and config.custom_prompt ~= "" then
@@ -149,51 +133,17 @@ end
 --- opts: profile ("main"|"subtask"), system_prompt?, tools?, notes?, todos?, goal?, depth?, parent_call_id?
 function M.new_frame(opts)
 	opts = opts or {}
-	local is_sub = opts.profile == "subtask" or opts.role == "subtask"
 
-	local system = opts.system_prompt
-		or (is_sub and M.subtask_system_prompt or M.system_prompt)
-
-	local tool_list
-	if is_sub then
-		tool_list = M.sanitize_subtask_tools(opts.tools)
-		if #tool_list == 0 then
-			tool_list = { "read", "shell", "send_image", "todos", "notes" }
-		end
-	else
-		tool_list = opts.tools or M.main_tools
-	end
+	local tool_list = opts.tools or M.main_tools
 
 	local todos = {}
 	local next_id = 1
-	if type(opts.todos) == "table" then
-		for _, t in ipairs(opts.todos) do
-			local item
-			if type(t) == "string" then
-				item = { id = next_id, text = t, status = "pending" }
-			elseif type(t) == "table" and t.text then
-				item = {
-					id = t.id or next_id,
-					text = t.text,
-					status = t.status or "pending",
-				}
-			end
-			if item then
-				table.insert(todos, item)
-				if item.id >= next_id then
-					next_id = item.id + 1
-				end
-			end
-		end
-	end
 
 	local frame = {
-		role = is_sub and "subtask" or "main",
-		label = is_sub and "SUBTASK" or "MAIN",
-		system_prompt = system,
+		system_prompt = opts.system_prompt,
 		tools = tool_list,
-		history = { { role = "system", content = system } },
-		notes = opts.notes or "",
+		history = { { role = "system", content = opts.system_prompt } },
+		notes = "",
 		todos = todos,
 		todos_next_id = next_id,
 		depth = opts.depth or 0,

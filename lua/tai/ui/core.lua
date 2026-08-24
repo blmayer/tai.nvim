@@ -768,7 +768,7 @@ function M.send_input()
 				return
 			else
 				M.append("{{{ Declined " .. args.command .. " (user: " .. input .. ")\n}}}\n")
-				res.content = "User declined running this command"
+				res.content = "User declined running this command: " .. input
 				table.insert(history, res)
 				table.remove(pending_tools, 1)
 				run_tools(pending_tools, frame, 1, function(stop)

@@ -81,10 +81,7 @@ M.defs = {
 		["function"] = {
 			name = "subtask",
 			description =
-			"Spawn a focused subtask with its own history so the main chat stays clean. "
-				.. "When it finishes (final text reply), only that summary plus its notes/todos "
-				.. "return as the tool result. Provide goal, tools, and optionally system_prompt, "
-				.. "notes, and todos to seed the child.",
+			"Spawn a focused agent to work independently on a task. When it finishes (final text reply), you get that text plus its notes/todos. Provide goal, tools, and optionally notes, and todos to seed the agent.",
 			parameters = {
 				type = "object",
 				properties = {
@@ -100,12 +97,6 @@ M.defs = {
 						description =
 						"Tools for the child. Read-only: [\"read\",\"shell\",\"send_image\",\"todos\",\"notes\"]. "
 							.. "Read-write: add \"edit\",\"write\". Minimal set preferred.",
-					},
-					system_prompt = {
-						type = "string",
-						description =
-						"Optional system prompt override (persona/constraints). "
-							.. "Defaults to the focused subtask agent prompt.",
 					},
 					notes = {
 						type = "string",
@@ -183,7 +174,7 @@ M.defs = {
 		["function"] = {
 			name = "edit",
 			description =
-			"Use this to edit existing files by providing the old content changed. If old_text is empty, changes are made at the start of the file. Matching uses line-by-line comparison after normalizing whitespace (collapse runs of spaces, trim). If the first line of old_text appears multiple times, the matcher tries all possible alignments until the full old_text block matches.",
+			"Use this to edit existing files by providing the old content to be replaced by the new content. If old_text is empty, changes are made at the start of the file. Matching uses line-by-line comparison after normalizing whitespace (collapse runs of spaces, trim).",
 			parameters = {
 				type = "object",
 				properties = {
