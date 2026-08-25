@@ -1,6 +1,4 @@
 local M = {}
-local log = require('tai.log')
-local config = require("tai.config")
 
 -- Import submodules
 local tools_io = require("tai.tools.io")
@@ -20,11 +18,9 @@ M.write = tools_subtask.write
 M.image_data_url = tools_subtask.image_data_url
 
 -- Re-export helper functions
-M.format_todos = tools_subtask.format_todos
 M.format_notes = tools_subtask.format_notes
 M.render_memory = tools_subtask.render_memory
 M.format_complete = tools_subtask.format_complete
-M.run_todos = tools_subtask.run_todos
 M.run_notes = tools_subtask.run_notes
 M.run_skill = tools_skill.run
 M.run_mcp = tools_mcp.run
@@ -81,44 +77,33 @@ M.defs = {
 		["function"] = {
 			name = "subtask",
 			description =
-			"Spawn a focused agent to work independently on a task. When it finishes (final text reply), you get that text plus its notes/todos. Provide goal, tools, and optionally notes, and todos to seed the agent.",
+			"Spawn an agent for one smaller next step, not the whole Goal. "
+				.. "`goal` is one verb + one target, and must ask for a short fact "
+				.. "(not file contents or command output). One subtask per turn.",
 			parameters = {
 				type = "object",
 				properties = {
 					goal = {
 						type = "string",
 						description =
-						"What the subtask must accomplish. Include all context it needs "
-							.. "(paths, lines, constraints). It cannot see prior conversation.",
+						"One action + one target, narrower than the current Goal. "
+							.. "Say what fact to return (name, path, yes/no). "
+							.. "Do not ask the child to return code or dumps.",
 					},
 					tools = {
 						type = "array",
 						items = { type = "string" },
 						description =
-						"Tools for the child. Read-only: [\"read\",\"shell\",\"send_image\",\"todos\",\"notes\"]. "
-							.. "Read-write: add \"edit\",\"write\". Minimal set preferred.",
+						"Tools for the child. Default is the implementation set "
+							.. "(read/edit/shell/subtask/…). Minimal set preferred.",
 					},
-					notes = {
+					system_prompt = {
 						type = "string",
-						description = "Optional initial notes for the child (e.g. plan snapshot).",
-					},
-					todos = {
-						type = "array",
-						description = "Optional initial todos (strings or {text, status}).",
-						items = {
-							type = "object",
-							properties = {
-								text = { type = "string" },
-								status = {
-									type = "string",
-									enum = { "pending", "in_progress", "done", "cancelled" },
-								},
-							},
-						},
+						description = "Optional custom system prompt for the child.",
 					},
 				},
 				additionalProperties = false,
-				required = { "goal", "tools" },
+				required = { "goal" },
 			},
 		},
 	},
@@ -200,39 +185,6 @@ M.defs = {
 				required = { "file", "old_text", "new_text" }
 			}
 		}
-	},
-	todos = {
-		type = "function",
-		["function"] = {
-			name = "todos",
-			description =
-			"Update this agent's todo list (injected every turn). Actions: add, update.",
-			parameters = {
-				type = "object",
-				properties = {
-					action = {
-						type = "string",
-						description = "add or update",
-						enum = { "add", "update" },
-					},
-					text = {
-						type = "string",
-						description = "Todo text. Required for add; optional for update.",
-					},
-					id = {
-						type = "number",
-						description = "Todo id. Required for update.",
-					},
-					status = {
-						type = "string",
-						description = "pending | in_progress | done | cancelled",
-						enum = { "pending", "in_progress", "done", "cancelled" },
-					},
-				},
-				additionalProperties = false,
-				required = { "action" },
-			},
-		},
 	},
 	notes = {
 		type = "function",
@@ -320,8 +272,6 @@ M.defs = {
 	},
 }
 
--- Export MAX constants
 M.MAX_TOOL_OUTPUT = tools_io.MAX_TOOL_OUTPUT
-M.MAX_NOTES_CHARS = tools_io.MAX_NOTES_CHARS
 
 return M

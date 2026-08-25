@@ -7,6 +7,10 @@
 
 # Backup files
 *~
+*.bak
+
+# macOS
+.DS_Store
 
 # Local configuration
 lua/tai/local_config.lua

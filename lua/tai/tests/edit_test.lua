@@ -57,11 +57,6 @@ local function assert_not_contains(haystack, needle, msg)
     end
 end
 
--- Helper for plain substring search (avoids any Lua string escape issues with special chars like '(' )
-local function has_substr(haystack, needle)
-    return haystack:find(needle, 1, true) ~= nil
-end
-
 local function assert_equals(actual, expected, msg)
     if actual ~= expected then
         print("FAIL: " .. (msg or ""))

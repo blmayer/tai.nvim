@@ -63,10 +63,64 @@ function M.build_request_tools(api_format, tool_list)
 	return request_tools
 end
 
+local function read_http_status(path)
+	if not path then
+		return nil
+	end
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local code
+	for line in f:lines() do
+		local c = line:match("^HTTP/%S+%s+(%d+)")
+		if c then
+			code = tonumber(c)
+		end
+	end
+	f:close()
+	pcall(os.remove, path)
+	return code
+end
+
+local function http_status_label(code)
+	if code == 429 then
+		return "429 Too Many Requests"
+	end
+	if code == 401 or code == 403 then
+		return tostring(code) .. " Unauthorized"
+	end
+	if code then
+		return "HTTP " .. tostring(code)
+	end
+	return "provider"
+end
+
+--- Build a clear error string that keeps the error type (e.g. 429).
+function M.classify_error(http_code, parsed, raw_body, fallback)
+	local detail = ""
+	if type(parsed) == "table" and (parsed.error or parsed.message or parsed.msg) then
+		detail = M.format_error(parsed.error or parsed.message or parsed.msg, "")
+	elseif type(parsed) == "string" then
+		detail = parsed
+	end
+	if (not detail or detail == "") and type(raw_body) == "string" and raw_body ~= "" then
+		detail = raw_body:sub(1, 400)
+	end
+	if not detail or detail == "" then
+		detail = fallback or "request failed"
+	end
+	if type(detail) == "string" and detail:match("^ERROR %[") then
+		return detail
+	end
+	return string.format("ERROR [%s]: %s", http_status_label(http_code), detail)
+end
+
 -- Streaming HTTP client using vim.uv process
 -- Reads curl output line-by-line for true streaming support
 function M.make_http_call(url, api_key, body_json, on_complete)
 	local tmp = vim.fn.tempname()
+	local hdr = vim.fn.tempname()
 	local ok_write, write_err = pcall(vim.fn.writefile, { body_json }, tmp)
 	if not ok_write then
 		return on_complete(nil, "Failed to write request body to temp file: " .. tostring(write_err))
@@ -74,6 +128,7 @@ function M.make_http_call(url, api_key, body_json, on_complete)
 
 	local function cleanup()
 		pcall(vim.fn.delete, tmp)
+		pcall(vim.fn.delete, hdr)
 	end
 
 	local response = ""
@@ -81,6 +136,7 @@ function M.make_http_call(url, api_key, body_json, on_complete)
 	local job_id = vim.fn.jobstart({
 		"curl",
 		"-s",
+		"-D", hdr,
 		"-X", "POST", url,
 		"-H", "Authorization: Bearer " .. api_key,
 		"-H", "HTTP-Referer: https://terminal.pink/tai/index.html",
@@ -110,20 +166,28 @@ function M.make_http_call(url, api_key, body_json, on_complete)
 		end,
 
 		on_exit = function(_, code)
-			cleanup()
+			local http_code = read_http_status(hdr)
+			pcall(vim.fn.delete, tmp)
 			if code ~= 0 then
 				log.debug("[API] command returned code " .. tostring(code))
-				on_complete(nil, "curl returned code " .. tostring(code))
+				on_complete(nil, M.classify_error(http_code, nil, response, "curl returned code " .. tostring(code)))
 				return
 			end
 			if response == "" then
-				on_complete(nil, "empty response from provider")
+				on_complete(nil, M.classify_error(http_code, nil, nil, "empty response from provider"))
 				return
 			end
 			local ok, parsed = pcall(vim.json.decode, response)
 			if not ok or not parsed then
-				on_complete(nil, "Failed to decode JSON response")
+				on_complete(nil, M.classify_error(http_code, nil, response, "Failed to decode JSON response"))
 				return
+			end
+			if http_code and http_code >= 400 then
+				on_complete(nil, M.classify_error(http_code, parsed, response, "no choices received"))
+				return
+			end
+			if type(parsed) == "table" then
+				parsed._http_code = http_code
 			end
 			on_complete(parsed, nil)
 		end,
@@ -212,6 +276,7 @@ end
 -- Reads curl output line-by-line for true streaming support
 function M.make_streaming_http_call(url, api_key, body_json, on_chunk, on_complete)
 	local tmp = vim.fn.tempname()
+	local hdr = vim.fn.tempname()
 	local ok_write, write_err = pcall(vim.fn.writefile, { body_json }, tmp)
 	if not ok_write then
 		return on_complete(nil, "Failed to write request body to temp file: " .. tostring(write_err))
@@ -219,12 +284,14 @@ function M.make_streaming_http_call(url, api_key, body_json, on_chunk, on_comple
 
 	local function cleanup()
 		pcall(vim.fn.delete, tmp)
+		pcall(vim.fn.delete, hdr)
 	end
 
 	local job_id = vim.fn.jobstart({
 		"curl",
 		"-s",
 		"-N",
+		"-D", hdr,
 		"-X", "POST", url,
 		"-H", "Authorization: Bearer " .. api_key,
 		"-H", "HTTP-Referer: https://terminal.pink/tai/index.html",
@@ -256,10 +323,15 @@ function M.make_streaming_http_call(url, api_key, body_json, on_chunk, on_comple
 		end,
 
 		on_exit = function(_, code)
-			cleanup()
+			local http_code = read_http_status(hdr)
+			pcall(vim.fn.delete, tmp)
 			if code ~= 0 then
 				log.debug("[API] command returned code " .. tostring(code))
-				on_complete(nil, "curl returned code " .. tostring(code))
+				on_complete(nil, M.classify_error(http_code, nil, nil, "curl returned code " .. tostring(code)))
+				return
+			end
+			if http_code and http_code >= 400 then
+				on_complete(nil, M.classify_error(http_code, nil, nil, "no choices received"))
 				return
 			end
 			on_complete(nil, nil)
@@ -274,15 +346,15 @@ end
 
 function M.parse_response(res)
 	if not res then
-		return nil, "empty response"
+		return nil, M.classify_error(nil, nil, nil, "empty response")
 	end
 
 	if res.error and res.error ~= vim.NIL then
-		return nil, M.format_error(res.error)
+		return nil, M.classify_error(res._http_code, res, nil, M.format_error(res.error))
 	end
 
 	if not res.choices or #res.choices == 0 or not res.choices[1].message then
-		return nil, "no choices received"
+		return nil, M.classify_error(res._http_code, res, nil, "no choices received")
 	end
 
 	local fields, extract_err = M.extract_fields(res.choices[1].message)
@@ -322,10 +394,10 @@ function M.parse_chunk(chunk)
 	log.debug("[API] parsed chunk: " .. vim.inspect(decoded))
 
 	if decoded.error and decoded.error ~= vim.NIL then
-		return nil, M.format_error(decoded.error)
+		return nil, M.classify_error(decoded._http_code, decoded, nil, M.format_error(decoded.error))
 	end
 	if decoded.object == "error" then
-		return nil, M.format_error(decoded.message or decoded)
+		return nil, M.classify_error(decoded._http_code, decoded, nil, M.format_error(decoded.message or decoded))
 	end
 
 	local fields = {}

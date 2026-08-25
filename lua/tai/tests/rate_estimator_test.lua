@@ -18,9 +18,8 @@ local agent = require("tai.agent")
 local tools = require("tai.tools")
 local providers = require("tai.providers")
 
-local main = agent.profiles.main
 local tool_list = {}
-for _, name in ipairs(main.tools) do
+for _, name in ipairs(agent.main_tools) do
   if tools.defs[name] then
     table.insert(tool_list, tools.defs[name])
   end
@@ -29,7 +28,7 @@ end
 local body = {
   model = "test",
   messages = {
-    { role = "system", content = main.prompt },
+    { role = "system", content = agent.system_prompt },
   },
   tools = tool_list,
 }

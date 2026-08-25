@@ -3,7 +3,6 @@ local log = require('tai.log')
 
 -- Max characters returned from read/shell tools to the model (head+tail truncation).
 M.MAX_TOOL_OUTPUT = 80000
-M.MAX_NOTES_CHARS = 6000
 
 --- Truncate oversized tool output before it is sent back to the agent.
 --- Keeps head and tail so build/log errors near the end are still visible.
@@ -189,8 +188,6 @@ function M.read_file(file_path, range)
 	return M.limit_output(numbered_content, "read:" .. file_path)
 end
 
--- Export helper functions for other modules
-M.parse_lines = parse_lines
 M.is_binary_file = is_binary_file
 
 return M

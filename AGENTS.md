@@ -15,10 +15,8 @@ These notes are intended for **automated coding agents** working in this reposit
   - `providers.lua` / `provider_common.lua` — provider adapters
   - `tools.lua` — tool **schemas** + re-exports
   - `tools/` — implementation modules (`io`, `shell`, `edit`, `subtask`, `skill`, `mcp`)
-  - `ui.lua` — facade wiring ui modules
+  - `ui.lua` — thin facade over `ui/core.lua`
   - `ui/core.lua` — stack, continue loop, tool runner, chat UI
-  - `ui/session.lua` — persistence helpers (if used)
-  - `ui/tools.lua` — alternate/legacy tool-runner path
   - `context.lua` — session file load/save
   - `log.lua` — logging
 - `plugin/tai.lua` — optional autoload + `:Tai` user command
@@ -29,26 +27,30 @@ These notes are intended for **automated coding agents** working in this reposit
 ## Agent harness (runtime)
 
 ```
-stack[1] = MAIN frame (history + notes + todos)
-stack[2] = optional SUBTASK (goal, tools, system_prompt?, seed notes/todos)
+stack[1] = MAIN frame (history + goal + steps; multi-turn; tool: subtask)
+stack[2+] = isolated SUBTASK (clean history, goal, tools, steps)
+
+each frame.steps = completed sibling steps at that level
+  { text = child goal, response = child outcome }
 
 each request (ephemeral):
   system = base_prompt
          + MCP Servers state
-         + Live Context (notes/todos)   -- never stored in history
+         + CURRENT STATE: Goal + Previous steps
 
-subtask ends when the child returns with no tool_calls:
-  finish_subtask → parent tool result = summary + child notes + todos
-  UI fold closes (}}} )
+if you can answer, do it; else subtask until you can answer.
+a worker iterates only after `subtask` returns (work tools end the turn).
+it does not see the user's chat; its final text is the step response.
 ```
 
-- Main tools: `read`, `shell`, `send_image`, `edit`, `write`, `todos`, `notes`, `subtask`, `skill`, `mcp`
-- Child tools: only those listed in `subtask.tools` (never `subtask` itself); may include `mcp`
+- Main tools: `subtask` only
+- Child tools: those listed in `subtask.tools` (default: read/edit/shell/subtask/…)
 - Skills (Agent Skills spec): dirs under `~/.config/tai/skills/` and `<project>/.tai-skills/`, each with `SKILL.md`
   - Required frontmatter: `name` (1–64, `[a-z0-9-]+`, match dir name) + `description` (1–1024, non-empty)
   - Invalid skills are skipped; catalog = name+description; `skill` load injects markdown body only
-- Max depth: 2
-- No `complete` tool — final assistant text is the handoff
+- Max depth: 8
+- No `todos` tool — progress is Goal + Previous steps in Live Context
+- No `complete` tool — final assistant text or tool output is the handoff
 
 ## MCP
 
@@ -82,7 +84,7 @@ subtask ends when the child returns with no tool_calls:
   - Update README / www.
 
 - **Change system prompts**
-  - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`, `tool_usage`).
+  - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`).
 
 - **Provider-side tools (e.g. web_search)**
   - `.tai` field `provider_tools`.

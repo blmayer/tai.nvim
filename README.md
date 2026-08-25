@@ -3,8 +3,8 @@
 ![tai.nvim in action](www/screenshot.png)
 
 > A minimal, dependency-free Neovim plugin that brings AI coding agents directly
-> into your editor. It uses a **subtask harness**, per-agent Live Context
-> (notes/todos), session persistence, and many LLM providers.
+> into your editor. It uses a **subtask harness**, Live Context (goal + previous
+> steps), session persistence, and many LLM providers.
 
 <a href="https://dotfyle.com/plugins/blmayer/tai">
 	<img src="https://dotfyle.com/plugins/blmayer/tai/shield?style=flat" />
@@ -12,12 +12,12 @@
 
 ## Features
 
-- **Subtask harness** — spawn focused child agents with clean history; only
-  their final report (plus notes/todos) returns to the parent.
-- **Live Context** — each agent has private `notes` and `todos`, merged into
-  the system prompt every request (not stored in chat history).
-- **Flexible subtasks** — pass `goal`, `tools`, optional `system_prompt`, and
-  seed `notes`/`todos` for personas (planner, implementer, reviewer, …).
+- **Subtask harness** — if you can answer, do it; else `subtask` until you
+  can. Children start with a clean history and iterate only after a
+  subtask returns. Their final text is the result.
+- **Current state** — Goal + Previous steps at this level, shown as data
+  (not mixed into the instructions).
+- **Flexible subtasks** — pass `goal`, optional `tools` / `system_prompt`.
 - **Session persistence** — conversations auto-save/restore (`.tai-session.json`
   in the project root).
 - **Tool use** — read/write files, shell, edit, images, subtask, MCP.
@@ -32,63 +32,56 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  MAIN (long-lived)                                           │
-│  tools: read, shell, send_image, edit, write, notes, todos,  │
-│         subtask, mcp                                         │
-│  Live Context: notes + todos → injected into system each turn│
+│  MAIN (multi-turn, subtask only)                             │
+│  Live Context: Goal + Previous steps                         │
 │                                                              │
-│   user request → plan (explore / subtask) → auth if needed   │
+│   reply if done, else subtask(one concrete next step)        │
 │        │                                                     │
 │        ▼                                                     │
 │   ┌──────────────────────────────────────────────────────┐   │
-│   │  SUBTASK {{{ fold                                    │   │
-│   │  goal + tools + optional system_prompt / notes seed  │   │
-│   │  own history + private notes/todos                    │   │
-│   │  … work … → final text reply                         │   │
+│   │  SUBTASK (clean history)  fold                       │   │
+│   │  Goal + Previous steps at this level                 │   │
+│   │  work, or subtask, then next step or reply           │   │
 │   └──────────────────────┬───────────────────────────────┘   │
-│                          │ summary + child notes + todos     │
+│                          │ step recorded as previous step    │
 │                          ▼                                   │
-│   merge memory, verify, next step or answer user             │
+│   next subtask, or answer the user                           │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **Rules of the harness:**
 
-1. Each frame (main or subtask) has its own history and notes/todos.
-2. Notes/todos are **request-time only** — merged into the single system message
-   as **Live Context**; never written into message history.
-3. `subtask` opens a chat fold (`{{{ SUBTASK …`); when the child finishes with a
-   normal final reply (no more tool calls), the fold closes (`}}}`) and the
-   parent receives summary + child notes/todos.
-4. Max depth is 2 (main + one subtask). Children cannot spawn subtasks.
-5. Main can implement directly or delegate via subtask; the prompt prefers
-   plan → authorize → implement for non-trivial work.
+1. No `todos` tool. Agents **reply** or call **`subtask`** (one per turn).
+2. Live Context is **request-time only**: Goal, then Previous steps (1. … 2. …)
+   at this level, then “what is the next step?”
+3. `subtask` takes a concrete `goal` (not a copy of the current Goal). The
+   child has a **clean history** and only gets another turn after `subtask`.
+   Work tools end that turn. Its final text is the step’s result.
+4. Max depth is 8. Children may spawn one more-specific subtask.
+5. Main is the orchestrator (`subtask` only). Work happens in subagents.
 
 ### Subtask tool parameters
 
 | Field | Required | Description |
 |---|---|---|
-| `goal` | yes | Full charter for the child (it cannot see parent chat) |
-| `tools` | yes | Tool names granted to the child (minimal set) |
-| `system_prompt` | no | Override default focused-agent prompt (persona/constraints) |
-| `notes` | no | Seed the child’s notepad (e.g. accepted plan) |
-| `todos` | no | Seed the child’s todo list |
+| `goal` | yes | The next step (paths, action). Must not copy the current Goal |
+| `tools` | no | Tool names granted to the child (default: implementation set) |
+| `system_prompt` | no | Override the default worker prompt |
 
 Examples:
 
 ```json
 {
-  "goal": "Explore auth and produce a file-by-file fix plan.",
-  "tools": ["read", "shell", "send_image", "todos", "notes"]
+  "goal": "List lua/tai and report which file defines main_tools.",
+  "tools": ["read", "shell"]
 }
 ```
 
 ```json
 {
-  "goal": "Implement the plan in notes. Minimal diffs.",
-  "tools": ["read", "shell", "edit", "write", "todos", "notes"],
-  "system_prompt": "You are a careful implementer. Do not freestyle architecture.",
-  "notes": "Plan:\n- foo.lua: …"
+  "goal": "In lua/tai/agent.lua, change main_tools to only subtask. Minimal diff.",
+  "tools": ["read", "edit"],
+  "system_prompt": "You are a careful implementer. Do not freestyle architecture."
 }
 ```
 
@@ -267,13 +260,12 @@ Example `.tai` file:
 | `send_image` | Send images for visual analysis |
 | `edit` | Search-and-replace edit (`multi` flag supported) |
 | `write` | Create new files |
-| `subtask` | Spawn a child agent (`goal`, `tools`, optional `system_prompt` / seeds) |
-| `todos` | Add/update todos (auto-injected as Live Context; no list action) |
+| `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
 | `notes` | Write/append notes (auto-injected as Live Context; no read action) |
 | `mcp` | MCP status / connect / disconnect / list_tools / call |
 
-Main agent gets all of the above. Subtasks get only the tools listed in `tools`
-(never `subtask` itself). MCP may be granted to subtasks.
+Main agent gets only `subtask`. Subtasks get the tools listed in `tools`
+(default is the implementation set, including `subtask`).
 
 ### `mcp` tool
 

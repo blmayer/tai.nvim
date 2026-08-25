@@ -2,8 +2,6 @@ local M = {}
 local log = require('tai.log')
 local tools_io = require("tai.tools.io")
 
--- Export helper functions from io module
-M.parse_lines = tools_io.parse_lines
 M.is_binary_file = tools_io.is_binary_file
 
 local function normalize_whitespace(str)

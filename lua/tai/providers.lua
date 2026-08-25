@@ -100,11 +100,6 @@ function M.get_rate_limits()
 	}
 end
 
--- Check if there are pending throttle timers (requests waiting for rate limit).
-function M.is_throttled()
-	return #pending_timers > 0
-end
-
 -- Optional callback invoked when a request starts throttle-waiting.
 -- Set by the UI layer to update state indicators.
 M.on_throttle = nil
@@ -406,9 +401,9 @@ local function create_provider_module(provider_name)
 				log.debug("Request response: " .. vim.inspect(parsed))
 
 				if parsed and parsed.error and parsed.error ~= vim.NIL then
-					local err_msg = common.format_error(parsed.error)
+					local err_msg = common.classify_error(parsed._http_code, parsed, nil, common.format_error(parsed.error))
 					record_actual_cost(send_time, nil, err_msg)
-					return callback(nil, "Received error: " .. err_msg)
+					return callback(nil, err_msg)
 				end
 
 				local fields = {}
@@ -566,7 +561,7 @@ local function create_provider_module(provider_name)
 				end
 
 				if parsed and parsed.error and parsed.error ~= vim.NIL then
-					on_chunk(nil, "Received error: " .. common.format_error(parsed.error))
+					on_chunk(nil, common.classify_error(parsed._http_code, parsed, nil, common.format_error(parsed.error)))
 					return
 				end
 
@@ -706,14 +701,14 @@ local function create_provider_module(provider_name)
 		log.debug("[API] request response: " .. vim.inspect(parsed))
 
 		if parsed and parsed.error and parsed.error ~= vim.NIL then
-			local err_msg = common.format_error(parsed.error)
+			local err_msg = common.classify_error(parsed._http_code, parsed, nil, common.format_error(parsed.error))
 			record_actual_cost(send_time, nil, err_msg)
 			return callback(nil, err_msg)
 		end
 
 		local fields, parse_err = common.parse_response(parsed)
 		if parse_err or not fields then
-			local err_msg = parse_err or "empty provider response"
+			local err_msg = parse_err or "ERROR [provider]: empty provider response"
 			record_actual_cost(send_time, nil, err_msg)
 			return callback(nil, err_msg)
 		end

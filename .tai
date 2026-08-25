@@ -1,6 +1,7 @@
 {
 	"provider": "mistral",
-	"model": "mistral-small-latest",
-	"tpm": 50000,
-	"rpm": 30
+	"model": "mistral-medium-2508",
+	"tpm": 350000,
+	"auto_approve": true,
+	"rpm": 20
 }

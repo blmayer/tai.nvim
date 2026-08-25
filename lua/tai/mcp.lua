@@ -536,10 +536,6 @@ end
 
 -- ── Public API ────────────────────────────────────────────────────
 
-function M.get_servers()
-	return servers
-end
-
 function M.get_server(name)
 	return servers[name]
 end

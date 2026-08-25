@@ -24,11 +24,6 @@ function M.set_level(level)
 	M.level = level
 end
 
--- Set the log file path
-function M.set_log_file(path)
-	M.log_file = path
-end
-
 -- Log a message
 function M.log(level, message)
 	if level >= M.level then

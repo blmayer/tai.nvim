@@ -10,6 +10,7 @@ local tools_edit = require("tai.tools.edit")
 local tools_subtask = require("tai.tools.subtask")
 local tools_skill = require("tai.tools.skill")
 local tools_mcp = require("tai.tools.mcp")
+local nest = require("tai.ui.nest")
 local mcp = require("tai.mcp")
 
 if not config.provider then
@@ -25,7 +26,7 @@ local bufname_prefix = "tai-chat"
 local input_bufname = "tai-chat-input"
 
 -- Agent stack: main frame at [1], optional subtask on top
-local stack = { agent.new_frame({ profile = "main" }) }
+local stack = { agent.new_frame() }
 
 local hard_stop = false
 local pending_tools = nil
@@ -36,18 +37,133 @@ local function top()
 	return stack[#stack]
 end
 
+local function is_worker()
+	return #stack > 1
+end
+
+-- Nesting: MAIN is 0, first subtask is 1, its child is 2, …
+local function nest_depth(frame)
+	if frame and frame.depth and frame.depth > 0 then
+		return frame.depth
+	end
+	return math.max(0, #stack - 1)
+end
+
+local function nest_label(frame)
+	local d = nest_depth(frame)
+	if d < 1 then
+		return "MAIN"
+	end
+	return string.format("SUBTASK %d", d)
+end
+
+-- Keep collapsed fold text aligned with the subtask indent.
+-- Regular leading spaces are stripped from foldtext; use NBSP.
+_G.TaiChatFoldText = function()
+	local line = vim.fn.getline(vim.v.foldstart)
+	local indent = (line:match("^(%s*)") or ""):gsub(" ", "\194\160")
+	local n = vim.v.foldend - vim.v.foldstart + 1
+	return indent .. "{{{ " .. tostring(n) .. " lines }}}"
+end
+
+local function apply_fold_settings(win)
+	if not win or not vim.api.nvim_win_is_valid(win) then
+		return
+	end
+	-- Only tool output is folded (plain {{{ / }}}).
+	-- High foldlevel: buffer edits must not re-close folds the user opened.
+	vim.wo[win].foldmethod = "marker"
+	vim.wo[win].foldtext = "v:lua.TaiChatFoldText()"
+	vim.wo[win].foldenable = true
+	vim.wo[win].foldlevel = 99
+	vim.wo[win].wrap = true
+	vim.wo[win].breakindent = true
+	pcall(function()
+		vim.wo[win].fillchars = "fold: "
+	end)
+end
+
+-- Close only the newest tool fold. Leave folds the user opened alone,
+-- and do not move their cursor.
+local function refresh_and_close_folds()
+	if not chat_win or not vim.api.nvim_win_is_valid(chat_win) then
+		return
+	end
+	vim.api.nvim_win_call(chat_win, function()
+		if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
+			return
+		end
+		local lines = vim.api.nvim_buf_get_lines(M.buffer_nr, 0, -1, false)
+		local start
+		for i = #lines, 1, -1 do
+			if lines[i]:find("{{{", 1, true) then
+				start = i
+				break
+			end
+		end
+		if not start then
+			return
+		end
+		local view = vim.fn.winsaveview()
+		pcall(function()
+			vim.api.nvim_win_set_cursor(chat_win, { start, 0 })
+			vim.cmd("silent! normal! zc")
+		end)
+		pcall(vim.fn.winrestview, view)
+	end)
+end
+
+local function append_output(label, body, depth)
+	if label and label ~= "" then
+		M.append(label .. "\n", depth)
+	end
+	if body and body ~= "" then
+		M.append("{{{\n" .. body .. "\n}}}\n", depth)
+		refresh_and_close_folds()
+	end
+end
+
+-- Keep {{{ / }}} inside old/new text from closing the chat fold early.
+local function fold_safe(s)
+	if type(s) ~= "string" or s == "" then
+		return "(empty)"
+	end
+	return (s:gsub("}}}", "} } }"):gsub("{{{", "{ { {"))
+end
+
+local function format_edit_fold(old_text, new_text, result)
+	local parts = {
+		"old:",
+		fold_safe(old_text),
+		"",
+		"new:",
+		fold_safe(new_text),
+	}
+	if result and result ~= "" then
+		table.insert(parts, "")
+		table.insert(parts, result)
+	end
+	return table.concat(parts, "\n")
+end
+
 local function prepare_messages(frame)
 	local msgs = vim.deepcopy(frame.history)
 	if msgs[1] and msgs[1].role == "system" then
 		local parts = { frame.system_prompt }
-		-- MCP connection/tool state (request-ephemeral)
+		-- Main already has the full chat; only isolated workers need Goal/steps.
+		if frame.isolated then
+			local live = tools_subtask.render_memory(frame)
+			if live ~= "" then
+				table.insert(parts, live)
+			end
+		end
 		local mcp_section = mcp.render_prompt_section()
 		if mcp_section ~= "" then
-			table.insert(parts, mcp_section)
-		end
-		local live = tools_subtask.render_memory(frame)
-		if live ~= "" then
-			table.insert(parts, live)
+			table.insert(parts, table.concat({
+				"========== MCP ==========",
+				mcp_section,
+				"========== END MCP ==========",
+			}, "\n"))
 		end
 		-- Single system message (providers that allow only one); never stored in history.
 		msgs[1].content = table.concat(parts, "\n\n")
@@ -122,93 +238,6 @@ local function get_chat_lines()
 	return strip_restore_banners(vim.api.nvim_buf_get_lines(M.buffer_nr, 0, -1, false))
 end
 
-local function history_to_chat_lines(hist, agent_label)
-	local lines = {}
-	local function push(text)
-		if text == nil or text == vim.NIL then
-			return
-		end
-		if type(text) ~= "string" then
-			text = vim.inspect(text)
-		end
-		for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
-			table.insert(lines, line)
-		end
-	end
-	local function sep(title)
-		if #lines > 0 then
-			table.insert(lines, "")
-		end
-		table.insert(lines, "___ " .. title .. " " .. string.rep("_", 40))
-	end
-
-	for _, msg in ipairs(hist or {}) do
-		if not msg or msg.role == "system" then
-			goto continue
-		end
-		if msg.role == "user" then
-			sep("USER")
-			push(msg.content)
-		elseif msg.role == "assistant" then
-			sep(agent_label)
-			if msg.reasoning and msg.reasoning ~= "" and msg.reasoning ~= vim.NIL then
-				table.insert(lines, "{{{ Thinking")
-				push(msg.reasoning)
-				table.insert(lines, "}}}")
-			end
-			if msg.content and msg.content ~= "" and msg.content ~= vim.NIL then
-				push(msg.content)
-			end
-			if msg.tool_calls and #msg.tool_calls > 0 then
-				for _, call in ipairs(msg.tool_calls) do
-					local fn = call["function"] or {}
-					table.insert(lines, "{{{ Tool call: " .. (fn.name or "?"))
-					local args = fn.arguments or ""
-					push(type(args) == "string" and args or vim.inspect(args))
-					table.insert(lines, "}}}")
-				end
-			end
-		elseif msg.role == "tool" then
-			table.insert(lines, "{{{ " .. (msg.name or "tool"))
-			push(msg.content)
-			table.insert(lines, "}}}")
-		end
-		::continue::
-	end
-	return lines
-end
-
-local function chat_lines_usable(chat_lines)
-	if type(chat_lines) ~= "table" or #chat_lines == 0 then
-		return false
-	end
-	for _, line in ipairs(chat_lines) do
-		if type(line) == "string" and line:match("%S") and not line:match("^%[tai%] Restored session") then
-			return true
-		end
-	end
-	return false
-end
-
-local function restore_chat_buffer(data)
-	if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
-		return
-	end
-	local lines
-	if chat_lines_usable(data.chat_lines) then
-		lines = strip_restore_banners(vim.deepcopy(data.chat_lines))
-		log.info(string.format("[persist] restoring chat_lines (%d lines)", #lines))
-	else
-		local main = stack[1]
-		log.info("[persist] rebuilding chat from main history")
-		lines = history_to_chat_lines(main and main.history, "MAIN")
-	end
-	if #lines == 0 then
-		lines = { "" }
-	end
-	vim.api.nvim_buf_set_lines(M.buffer_nr, 0, -1, false, lines)
-end
-
 local function save_session()
 	if not config.context or not config.context.enabled then
 		return
@@ -226,12 +255,6 @@ end
 local function maybe_auto_save()
 	if config.context and config.context.enabled and config.context.auto_save then
 		save_session()
-	end
-end
-
-local function ensure_system(frame)
-	if not frame.history[1] or frame.history[1].role ~= "system" then
-		table.insert(frame.history, 1, { role = "system", content = frame.system_prompt })
 	end
 end
 
@@ -298,17 +321,29 @@ function M.init()
 	update_input_name()
 end
 
-function M.append(content)
-	local new_lines = vim.split(content, "\n")
+function M.append(content, depth)
+	if content == nil or content == vim.NIL then
+		return
+	end
+	if type(content) ~= "string" then
+		content = tostring(content)
+	end
+	if depth == nil then
+		depth = nest_depth(top())
+	end
 	local function do_append()
+		if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
+			return
+		end
+		local last = vim.api.nvim_buf_get_lines(M.buffer_nr, -2, -1, false)
+		local last_line = last and last[1] or ""
+		local merged = nest.apply(content, depth, last_line)
+		local lines = vim.split(merged, "\n", { plain = true })
 		local line_num = vim.api.nvim_buf_line_count(M.buffer_nr)
-		local cur_content = vim.api.nvim_buf_get_lines(M.buffer_nr, -2, -1, false)
-		if not cur_content or not cur_content[1] then
-			vim.api.nvim_buf_set_lines(M.buffer_nr, 0, 0, false, new_lines)
+		if not last[1] then
+			vim.api.nvim_buf_set_lines(M.buffer_nr, 0, 0, false, lines)
 		else
-			cur_content[1] = cur_content[1] .. content
-			local merged = vim.split(cur_content[1], "\n")
-			vim.api.nvim_buf_set_lines(M.buffer_nr, line_num - 1, line_num, false, merged)
+			vim.api.nvim_buf_set_lines(M.buffer_nr, line_num - 1, line_num, false, lines)
 		end
 	end
 	if vim.in_fast_event() then
@@ -320,7 +355,7 @@ end
 
 function M.update_chat_name()
 	local fr = top()
-	local role = fr and fr.label or "MAIN"
+	local role = nest_label(fr)
 	local state_part = current_state or "idle"
 	local name
 	if config and config.provider and config.model then
@@ -381,18 +416,7 @@ local function add_sep(title)
 	M.append("\n" .. result .. "\n")
 end
 
-local function refresh_and_close_folds()
-	if not chat_win or not vim.api.nvim_win_is_valid(chat_win) then
-		return
-	end
-	vim.api.nvim_win_call(chat_win, function()
-		local last_line = vim.api.nvim_buf_line_count(M.buffer_nr)
-		vim.api.nvim_win_set_cursor(chat_win, { last_line, 0 })
-		pcall(vim.cmd, "silent! normal! zc")
-	end)
-end
-
-local function run_live_shell(command, on_done)
+local function run_live_shell(command, on_done, depth)
 	local chunks = {}
 	local shell = vim.o.shell or "sh"
 	local flag = vim.o.shellcmdflag or "-c"
@@ -424,7 +448,7 @@ local function run_live_shell(command, on_done)
 			end
 			local text = table.concat(data, "\n")
 			if text ~= "" then
-				M.append(text)
+				M.append(text, depth)
 				table.insert(chunks, text)
 			end
 		end,
@@ -434,7 +458,7 @@ local function run_live_shell(command, on_done)
 			end
 			local text = table.concat(data, "\n")
 			if text ~= "" then
-				M.append(text)
+				M.append(text, depth)
 				table.insert(chunks, text)
 			end
 		end,
@@ -474,28 +498,117 @@ local function run_live_shell(command, on_done)
 	end))
 end
 
--- Finish current subtask: pop stack, deliver tool result to parent, resume.
-local function finish_subtask(status, summary)
-	if #stack <= 1 then
+local function stringify_tool_content(content)
+	if content == nil or content == vim.NIL then
+		return ""
+	end
+	if type(content) == "string" then
+		return content
+	end
+	return vim.inspect(content)
+end
+
+local function record_tool_output(frame, content)
+	if not frame or not is_worker() then
+		return
+	end
+	frame.tool_outputs = frame.tool_outputs or {}
+	local text = stringify_tool_content(content)
+	if text == "" then
+		return
+	end
+	table.insert(frame.tool_outputs, text)
+end
+
+-- Worker is done: print reply at this indent, then pop and resume parent.
+local function finish_oneshot(frame, assistant_text, status)
+	if not frame or #stack <= 1 then
 		return false
 	end
-	local child = top()
-	local result = tools_subtask.format_complete(status, summary, child)
-	M.append(string.format("\n[subtask %s] %s\n}}}\n", status or "ok", summary or ""))
-	refresh_and_close_folds()
-	table.remove(stack)
+	if not status then
+		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
+			status = "error"
+		else
+			status = "ok"
+		end
+	end
+	local outcome = tools_subtask.outcome_for(frame, assistant_text)
+	if not frame._printed_content and outcome and outcome ~= "" and outcome ~= "(no output)" then
+		M.append("\n" .. outcome .. "\n", nest_depth(frame))
+	end
+	if top() == frame then
+		table.remove(stack)
+	end
+	local report = tools_subtask.format_complete(status, outcome, frame)
 	local parent = top()
-	table.insert(parent.history, {
-		role = "tool",
-		name = "subtask",
-		tool_call_id = child.parent_call_id,
-		content = result,
-	})
+	if parent then
+		report = tools_subtask.cap_report(report, 800)
+	end
+	if parent then
+		parent.steps = parent.steps or {}
+		table.insert(parent.steps, {
+			text = frame.goal or "",
+			response = report,
+			status = status,
+		})
+	end
 	M.update_chat_name()
 	update_input_name()
 	maybe_auto_save()
-	M.continue()
+	if frame.on_parent_resume then
+		local resume = frame.on_parent_resume
+		frame.on_parent_resume = nil
+		resume(report)
+		return true
+	end
+	if parent and frame.parent_call_id then
+		table.insert(parent.history, {
+			role = "tool",
+			name = "subtask",
+			tool_call_id = frame.parent_call_id,
+			content = report,
+		})
+	end
 	return true
+end
+
+local function after_tool_round(frame, stop)
+	maybe_auto_save()
+	if hard_stop then
+		if is_worker() then
+			finish_oneshot(frame, "ERROR [stopped]: Stopped by user", "error")
+		end
+		return
+	end
+	if stop then
+		return
+	end
+	-- Workers iterate only after a subtask returns. Work tools end the turn.
+	if is_worker() and not frame.continue_after_tools then
+		finish_oneshot(frame, frame.last_assistant)
+		return
+	end
+	M.continue()
+end
+
+local function decode_tool_args(raw)
+	if type(raw) == "table" then
+		return raw
+	end
+	if type(raw) ~= "string" or raw == "" then
+		return {}
+	end
+	local ok, decoded = pcall(vim.json.decode, raw)
+	if ok and type(decoded) == "table" then
+		return decoded
+	end
+	if ok and type(decoded) == "string" then
+		local ok2, decoded2 = pcall(vim.json.decode, decoded)
+		if ok2 and type(decoded2) == "table" then
+			return decoded2
+		end
+	end
+	return {}
 end
 
 local function run_tools(tool_calls, frame, start_index, on_done)
@@ -503,9 +616,11 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 	on_done = on_done or function() end
 	local stop = false
 	local history = frame.history
+	local depth = nest_depth(frame)
+	frame.continue_after_tools = false
 
 	if start_index == 1 then
-		M.append("\n")
+		M.append("\n", depth)
 	end
 
 	local function process_from(i)
@@ -523,10 +638,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 		local call = calls[i]
 		log.debug("[UI] running tool: " .. vim.inspect(call))
 		local name = call["function"].name
-		local ok_args, args = pcall(vim.json.decode, call["function"].arguments or "{}")
-		if not ok_args or type(args) ~= "table" then
-			args = {}
-		end
+		local args = decode_tool_args(call["function"].arguments)
 
 		local res = {
 			role = "tool",
@@ -535,7 +647,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 		}
 
 		local function finish_one()
-			refresh_and_close_folds()
+			record_tool_output(frame, res.content)
 			table.insert(history, res)
 			if stop then
 				on_done(true)
@@ -547,15 +659,15 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 		if name == "shell" then
 			local unsafe = tools_shell.unsafe_command(args.command)
 			if not unsafe or config.auto_approve then
-				local label = unsafe and "Auto-approved" or "Running"
-				M.append("{{{ " .. label .. ": " .. args.command .. "\n")
+				M.append("shell: " .. args.command .. "\n{{{\n", depth)
 				current_state = "tools"
 				update_input_name()
 				run_live_shell(args.command, function(out)
 					res.content = tools_io.limit_output(out, "shell")
-					M.append("\n}}}\n")
+					M.append((out or "") .. "\n}}}\n", depth)
+					refresh_and_close_folds()
 					finish_one()
-				end)
+				end, depth)
 				return
 			end
 			local tcs = {}
@@ -563,127 +675,154 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 				table.insert(tcs, calls[j])
 			end
 			pending_tools = tcs
-			M.append("Run `" .. args.command .. "`? (y/n/s) ")
+			M.append("Run `" .. args.command .. "`? (y/n/s) ", depth)
 			M.focus_input()
 			on_done(true)
 			return
 		elseif name == "read" then
 			if not args.file then
-				M.append("{{{ Attaching file failed: no file field.\n}}}")
+				M.append("read: missing file\n", depth)
 				res.content = "missing file field"
 			elseif vim.fn.filereadable(args.file) ~= 1 then
-				M.append("{{{ Attaching " .. args.file .. " failed\nFile not readable.}}}\n")
+				M.append("read: " .. args.file .. " not readable\n", depth)
 				res.content = "file does not exist or is not readable"
 			else
 				local range_label = args.range and (" [" .. args.range .. "]") or ""
-				M.append("{{{ Reading " .. args.file .. range_label .. "\n")
 				res.content = tools_io.read_file(args.file, args.range)
 				res.file_range = args.range
-				M.append(res.content .. "\n}}}\n")
+				append_output("read: " .. args.file .. range_label, res.content, depth)
 			end
 		elseif name == "edit" then
 			if not args.file then
-				M.append("{{{ Patching file failed: no file field.\n}}}")
+				M.append("edit: missing file\n", depth)
 				res.content = "missing file field"
 			else
 				local out = tools_edit.edit(args.file, args.old_text, args.new_text, args.multi, config)
 				res.content = out
-				local multi_label = args.multi and " (multi)" or ""
-				M.append("{{{ " .. out .. multi_label .. "\n" .. (args.old_text or "") .. "\n---\n" .. (args.new_text or "") .. "\n}}}\n")
+				append_output(
+					"edit: " .. args.file,
+					format_edit_fold(args.old_text, args.new_text, out),
+					depth
+				)
 			end
 		elseif name == "write" then
 			if not args.file then
-				M.append("{{{ Write file failed: no file field.\n}}}")
+				M.append("write: missing file\n", depth)
 				res.content = "missing file field"
 			elseif not args.content then
-				M.append("{{{ Write file failed: no content field.\n}}}")
+				M.append("write: missing content\n", depth)
 				res.content = "missing content field"
 			else
 				local out = tools_subtask.write(args.file, args.content)
 				res.content = out
-				M.append("{{{ " .. out .. "\n" .. args.content .. "\n}}}\n")
+				append_output("write: " .. args.file, out, depth)
 			end
 		elseif name == "subtask" then
-			if not args.goal or args.goal == "" then
-				M.append("{{{ Subtask failed: no goal.\n}}}\n")
+			local first_sub
+			for j, c in ipairs(calls) do
+				local fn = c["function"] or {}
+				if fn.name == "subtask" then
+					first_sub = j
+					break
+				end
+			end
+			local goal = args.goal or args.Goal or args.task
+			if type(goal) == "number" then
+				goal = tostring(goal)
+			end
+			if type(goal) == "string" then
+				goal = goal:match("^%s*(.-)%s*$") or goal
+			else
+				goal = nil
+			end
+			local parent_goal = tools_subtask.frame_goal(frame)
+			local norm = function(s)
+				s = tostring(s or ""):lower()
+				s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+				return s
+			end
+			if first_sub and i ~= first_sub then
+				M.append("subtask skipped: only one per turn\n", depth)
+				res.content = "Only one subtask per turn. Wait for this step, then continue."
+			elseif not goal or goal == "" then
+				M.append("subtask failed: no goal\n", depth)
 				res.content = "missing goal"
-			elseif type(args.tools) ~= "table" or #args.tools == 0 then
-				M.append("{{{ Subtask failed: tools list required.\n}}}\n")
-				res.content = "missing tools list"
-			elseif #stack >= (agent.MAX_DEPTH or 2) then
-				M.append("{{{ Subtask failed: max depth.\n}}}\n")
+			elseif parent_goal ~= "" and norm(goal) == norm(parent_goal) then
+				M.append("subtask failed: goal copies the current Goal\n", depth)
+				res.content = "goal must be a more specific next step, not a copy of the current Goal"
+			elseif #stack >= (agent.MAX_DEPTH or 8) then
+				M.append("subtask failed: max depth\n", depth)
 				res.content = "max subtask depth reached"
 			else
-				local child_tools = agent.sanitize_subtask_tools(args.tools)
+				local child_tools
+				if type(args.tools) == "table" and #args.tools > 0 then
+					child_tools = agent.sanitize_subtask_tools(args.tools)
+				else
+					child_tools = vim.deepcopy(agent.subtask_tools)
+				end
 				if #child_tools == 0 then
-					M.append("{{{ Subtask failed: no valid tools after sanitize.\n}}}\n")
+					M.append("subtask failed: no valid tools\n", depth)
 					res.content = "no valid tools"
 				else
-					local label = args.system_prompt and "custom" or "default"
-					M.append("{{{ SUBTASK (" .. label .. ")\nGoal: " .. args.goal
-						.. "\nTools: " .. table.concat(child_tools, ", ") .. "\n")
+					local child_depth = #stack
+					M.append("\nSUBTASK " .. goal .. "\n", depth)
 					local child = agent.new_frame({
 						profile = "subtask",
 						system_prompt = args.system_prompt,
 						tools = child_tools,
-						goal = args.goal,
-						notes = args.notes or "",
-						todos = args.todos,
-						depth = #stack,
+						goal = goal,
+						depth = child_depth,
 						parent_call_id = call.id,
 					})
+					child.on_parent_resume = function(report)
+						frame.continue_after_tools = true
+						res.content = report
+						finish_one()
+					end
 					table.insert(stack, child)
-					stop = true
 					M.update_chat_name()
 					update_input_name()
 					maybe_auto_save()
 					M.continue()
-					on_done(true)
 					return
 				end
 			end
-		elseif name == "todos" then
-			local out = tools_subtask.run_todos(args, frame)
-			res.content = out
-			local todos_content = tools_subtask.format_todos(frame.todos)
-			M.append("{{{ Todos (" .. (args.action or "?") .. ")\nAction result: " .. out .. "\n\nCurrent todos:\n" .. todos_content .. "\n}}}\n")
 		elseif name == "notes" then
 			local out = tools_subtask.run_notes(args, frame)
 			res.content = out
-			local notes_content = frame.notes ~= "" and frame.notes or "(empty)"
-			M.append("{{{ Notes (" .. (args.action or "?") .. ")\nAction result: " .. out .. "\n\nNotes content:\n" .. notes_content .. "\n}}}\n")
+			M.append("notes: " .. out .. "\n", depth)
 		elseif name == "skill" then
 			local out = tools_skill.run(args)
 			res.content = out
-			M.append("{{{ Skill (" .. (args.action or "?") .. ")\n" .. out .. "\n}}}\n")
+			append_output("skill: " .. (args.action or "?"), out, depth)
 		elseif name == "mcp" then
-			-- Async for connect/call
 			local async_actions = { connect = true, call = true }
 			if async_actions[args.action] then
-				M.append("{{{ MCP (" .. (args.action or "?") .. ")\n")
+				M.append("mcp: " .. (args.action or "?") .. "\n{{{\n", depth)
 				current_state = "tools"
 				update_input_name()
 				tools_mcp.run(args, function(out)
 					res.content = tools_io.limit_output(out or "", "mcp")
-					M.append(res.content .. "\n}}}\n")
+					M.append((out or "") .. "\n}}}\n", depth)
+					refresh_and_close_folds()
 					finish_one()
 				end)
 				return
 			end
 			local out = tools_mcp.run(args)
 			res.content = out
-			M.append("{{{ MCP (" .. (args.action or "?") .. ")\n" .. (out or "") .. "\n}}}\n")
+			append_output("mcp: " .. (args.action or "?"), out or "", depth)
 		elseif name == "send_image" then
 			if not args.file then
-				M.append("{{{ Adding image failed: no file field.\n}}}")
+				M.append("image: missing file\n", depth)
 				res.content = "Missing file field"
 			else
 				local image_url, err = tools_subtask.image_data_url(args.file)
 				if not image_url then
-					M.append("{{{ Adding image " .. args.file .. " failed: " .. err .. "\n}}}")
+					M.append("image: " .. args.file .. " failed: " .. err .. "\n", depth)
 					res.content = "Error: " .. err
 				else
-					M.append("{{{ Adding image " .. args.file .. "\n}}}")
+					M.append("image: " .. args.file .. "\n", depth)
 					local content = {}
 					if args.prompt then
 						table.insert(content, { type = "text", text = args.prompt })
@@ -697,7 +836,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			end
 		else
 			res.content = "Invalid tool name: " .. (name or "")
-			M.append("{{{ Invalid tool name\n}}}\n")
+			M.append("invalid tool: " .. (name or "") .. "\n", depth)
 		end
 
 		finish_one()
@@ -724,69 +863,66 @@ function M.send_input()
 
 		if pending_tools and #pending_tools > 0 then
 			local call = pending_tools[1]
-			local args = vim.json.decode(call["function"].arguments)
+			local args = decode_tool_args(call["function"].arguments)
 			local res = {
 				role = "tool",
 				name = call["function"].name,
 				tool_call_id = call.id,
 			}
 			local response = input:lower():gsub("^%s*(.-)%s*$", "%1")
-			M.append(input .. "\n")
-
-			local function after_pending()
-				maybe_auto_save()
-				add_sep("___ " .. (frame.label or "AGENT") .. " ")
-				M.continue()
-				update_input_name()
-			end
+			local depth = nest_depth(frame)
+			M.append(input .. "\n", depth)
 
 			if response == "y" or response == "yes" then
-				M.append("Confirmed...\n")
-				M.append("{{{ Running: " .. args.command .. "\n")
+				M.append("Confirmed...\n", depth)
+				M.append("shell: " .. args.command .. "\n{{{\n", depth)
 				run_live_shell(args.command, function(out)
-					res.content = tools_shell.limit_output(out, "shell")
-					M.append("\n}}}\n")
+					res.content = tools_io.limit_output(out, "shell")
+					M.append((out or "") .. "\n}}}\n", depth)
+					refresh_and_close_folds()
+					record_tool_output(frame, res.content)
 					table.insert(history, res)
 					table.remove(pending_tools, 1)
 					run_tools(pending_tools, frame, 1, function(stop)
-						if stop or hard_stop then
-							maybe_auto_save()
-							return
-						end
-						after_pending()
+						after_tool_round(frame, stop)
 					end)
-				end)
+				end, depth)
 				return
 			elseif response == "s" or response == "stop" then
-				M.append("Stopped\n")
-				M.append("{{{ Stopped at " .. args.command .. " (user: " .. input .. ")\n}}}\n")
+				M.append("Stopped\n", depth)
+				M.append("shell stopped: " .. args.command .. "\n", depth)
 				hard_stop = true
 				res.content = "User stopped execution."
+				record_tool_output(frame, res.content)
 				table.insert(history, res)
 				table.remove(pending_tools, 1)
+				if is_worker() then
+					finish_oneshot(frame, "ERROR [stopped]: Stopped by user", "error")
+				end
 				maybe_auto_save()
 				return
 			else
-				M.append("{{{ Declined " .. args.command .. " (user: " .. input .. ")\n}}}\n")
+				M.append("shell declined: " .. args.command .. "\n", depth)
 				res.content = "User declined running this command: " .. input
+				record_tool_output(frame, res.content)
 				table.insert(history, res)
 				table.remove(pending_tools, 1)
 				run_tools(pending_tools, frame, 1, function(stop)
-					if stop or hard_stop then
-						maybe_auto_save()
-						return
-					end
-					after_pending()
+					after_tool_round(frame, stop)
 				end)
 				return
 			end
 		else
+			if not is_worker() then
+				frame.goal = input
+				frame.steps = {}
+			end
 			table.insert(history, { role = "user", content = input })
 			add_sep("___ USER ")
 			M.append(input .. "\n")
 		end
 
-		add_sep("___ " .. (frame.label or "AGENT") .. " ")
+		add_sep("___ " .. nest_label(frame) .. " ")
 		maybe_auto_save()
 		M.continue()
 		update_input_name()
@@ -813,28 +949,22 @@ function M.open()
 			chat_win = vim.api.nvim_get_current_win()
 			vim.api.nvim_win_set_buf(chat_win, M.buffer_nr)
 			vim.api.nvim_win_set_width(chat_win, 80)
-			vim.api.nvim_win_set_config(chat_win, { fixed = true })
+			apply_fold_settings(chat_win)
+			-- First show: collapse existing tool dumps. Later updates
+			-- must not reset this, or user-opened folds slam shut.
+			vim.api.nvim_win_call(chat_win, function()
+				pcall(vim.cmd, "silent! normal! zM")
+			end)
 
 			vim.cmd("below split")
 			input_win = vim.api.nvim_get_current_win()
 			vim.api.nvim_win_set_buf(input_win, M.input_buffer_nr)
 			vim.api.nvim_win_set_height(input_win, 12)
-
-			if chat_win and vim.api.nvim_win_is_valid(chat_win) then
-				vim.wo[chat_win].foldmethod = "marker"
-				vim.wo[chat_win].foldenable = true
-				vim.wo[chat_win].foldlevel = 0
-			end
 		else
 			chat_win = vim.fn.win_getid(chat_window_nr)
-			vim.api.nvim_win_set_width(chat_win, 80)
 			local input_window_nr = vim.fn.bufwinnr(M.input_buffer_nr)
 			if input_window_nr ~= -1 then
 				input_win = vim.fn.win_getid(input_window_nr)
-			end
-			if chat_win and vim.api.nvim_win_is_valid(chat_win) then
-				vim.wo[chat_win].foldmethod = "marker"
-				vim.wo[chat_win].foldenable = true
 			end
 		end
 	end)
@@ -872,15 +1002,15 @@ function M.continue()
 	local hist = frame.history
 	local cfg = frame_config(frame)
 	local msgs = prepare_messages(frame)
-	local agent_label = frame.label or "AGENT"
+	local agent_label = nest_label(frame)
+	local out_depth = nest_depth(frame)
 
 	current_state = "waiting"
 	update_input_name()
 
 	local function on_idle_no_tools(content)
-		-- Subtask finished: final assistant text (+ notes/todos) returns to parent
-		if #stack > 1 then
-			finish_subtask("ok", content or "(no output)")
+		if is_worker() then
+			finish_oneshot(frame, content or "(no output)")
 			return
 		end
 		current_state = "idle"
@@ -892,66 +1022,63 @@ function M.continue()
 		current_state = "tools"
 		update_input_name()
 		local ok, err = pcall(run_tools, tool_calls, frame, 1, function(stop)
-			maybe_auto_save()
-			if stop or hard_stop then
-				return
-			end
-			M.continue()
+			after_tool_round(frame, stop)
 		end)
 		if not ok then
 			log.error("[UI] run_tools failed: " .. tostring(err))
-			M.append("{{{ Tool runner error\n" .. tostring(err) .. "\n}}}\n")
-			current_state = "idle"
-			update_input_name()
+			M.append("tool error: " .. tostring(err) .. "\n", out_depth)
+			if is_worker() then
+				finish_oneshot(frame, "ERROR [tools]: " .. tostring(err), "error")
+			else
+				current_state = "idle"
+				update_input_name()
+			end
 		end
 	end
 
 	if config.stream then
 		log.info(agent_label .. " streaming")
-		local think_start = true
-		local content_start = true
 		provider.request_stream(cfg, msgs, function(chunk, err)
 			if err then
 				current_state = "idle"
 				update_input_name()
-				M.append("\n{{{ Chunk error\n" .. err .. "\n}}}\n")
+				M.append("ERROR: " .. err .. "\n", out_depth)
 				return
 			end
 			if type(chunk) ~= "table" then
 				return
 			end
 			if chunk.reasoning and #chunk.reasoning > 0 then
-				if think_start then
-					current_state = "thinking"
-					update_input_name()
-					M.append("{{{ Thinking \n" .. chunk.reasoning)
-					think_start = false
-				else
-					M.append(chunk.reasoning)
-				end
+				current_state = "thinking"
+				update_input_name()
+				M.append(chunk.reasoning, out_depth)
 			end
 			if chunk.content and chunk.content ~= "" then
-				if content_start and not think_start then
-					M.append("\n}}}\n")
-					refresh_and_close_folds()
-					content_start = false
+				if type(chunk.content) == "string" then
+					M.append(chunk.content, out_depth)
+					frame._printed_content = true
 				end
-				M.append(chunk.content)
 			end
 		end, function(data, err)
 			if err then
 				current_state = "idle"
 				update_input_name()
-				M.append("{{{ Received error\n" .. err .. "\n}}}\n")
+				M.append("ERROR: " .. err .. "\n", out_depth)
 				table.insert(hist, { role = "assistant", content = err })
+				if is_worker() then
+					finish_oneshot(frame, err, "error")
+				end
 				return
 			end
 			if type(data) ~= "table" then
 				current_state = "idle"
 				update_input_name()
-				local msg = "empty provider response"
-				M.append("{{{ Received error\n" .. msg .. "\n}}}\n")
+				local msg = "ERROR [provider]: empty provider response"
+				M.append(msg .. "\n", out_depth)
 				table.insert(hist, { role = "assistant", content = msg })
+				if is_worker() then
+					finish_oneshot(frame, msg, "error")
+				end
 				maybe_auto_save()
 				return
 			end
@@ -959,16 +1086,25 @@ function M.continue()
 			for k, v in pairs(data) do
 				response[k] = v
 			end
+			frame.last_assistant = data.content
 			table.insert(hist, response)
-
-			if not think_start and content_start then
-				M.append("\n}}}\n")
+			if data.content and type(data.content) == "string" and data.content ~= "" then
+				if not frame._printed_content then
+					M.append(data.content .. "\n", out_depth)
+					frame._printed_content = true
+				else
+					M.append("\n", out_depth)
+				end
 			end
 			if data.token_usage then
 				update_input_name()
 			end
 			if data.error then
-				M.append("{{{ Provider returned error\n" .. data.error .. "\n}}}")
+				M.append("ERROR: " .. tostring(data.error) .. "\n", out_depth)
+				if is_worker() then
+					finish_oneshot(frame, "ERROR [provider]: " .. tostring(data.error), "error")
+					return
+				end
 			end
 			if not data.tool_calls or #data.tool_calls == 0 then
 				on_idle_no_tools(data.content)
@@ -982,17 +1118,23 @@ function M.continue()
 			if err then
 				current_state = "idle"
 				update_input_name()
-				M.append("{{{ Error\n" .. err .. "\n}}}")
+				M.append("ERROR: " .. err .. "\n", out_depth)
 				table.insert(hist, { role = "assistant", content = err })
+				if is_worker() then
+					finish_oneshot(frame, err, "error")
+				end
 				maybe_auto_save()
 				return
 			end
 			if type(fields) ~= "table" then
 				current_state = "idle"
 				update_input_name()
-				local msg = "empty provider response"
-				M.append("{{{ Error\n" .. msg .. "\n}}}")
+				local msg = "ERROR [provider]: empty provider response"
+				M.append(msg .. "\n", out_depth)
 				table.insert(hist, { role = "assistant", content = msg })
+				if is_worker() then
+					finish_oneshot(frame, msg, "error")
+				end
 				maybe_auto_save()
 				return
 			end
@@ -1000,6 +1142,7 @@ function M.continue()
 			for k, v in pairs(fields) do
 				response[k] = v
 			end
+			frame.last_assistant = fields.content
 			table.insert(hist, response)
 			M.open()
 
@@ -1007,14 +1150,16 @@ function M.continue()
 				update_input_name()
 			end
 			if fields.error then
-				M.append("{{{ Provider returned error\n" .. fields.error .. "\n}}}")
+				M.append("ERROR: " .. tostring(fields.error) .. "\n", out_depth)
+				if is_worker() then
+					finish_oneshot(frame, "ERROR [provider]: " .. tostring(fields.error), "error")
+					return
+				end
 			end
-			if fields.reasoning then
-				M.append("{{{ Thinking\n" .. fields.reasoning .. "\n}}}\n")
-				refresh_and_close_folds()
-			end
-			if fields.content and fields.content ~= vim.NIL and fields.content ~= "" then
-				M.append(fields.content .. "\n")
+			if fields.content and fields.content ~= vim.NIL and fields.content ~= ""
+				and type(fields.content) == "string" then
+				M.append(fields.content .. "\n", out_depth)
+				frame._printed_content = true
 			end
 			if not fields.tool_calls or #fields.tool_calls == 0 then
 				on_idle_no_tools(fields.content)

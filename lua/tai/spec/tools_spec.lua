@@ -42,7 +42,7 @@ local mock_io_open = {
 describe("tools module", function()
   local frame
   before_each(function()
-    frame = { notes = "", todos = {}, todos_next_id = 1 }
+    frame = { notes = "", goal = "do the thing", steps = {} }
     -- Reset config state
     config.allowed_commands = nil
   end)
@@ -249,25 +249,6 @@ describe("tools module", function()
     end)
   end)
 
-  describe("run_todos", function()
-    it("should add todo items", function()
-      local result = tools.run_todos({ action = "add", text = "Test todo" }, frame)
-      assert.are.match("Added todo #%d+: %[pending%] Test todo", result)
-      assert.are.equal(1, #frame.todos)
-    end)
-
-    it("should update todo items", function()
-      tools.run_todos({ action = "add", text = "Test todo" }, frame)
-      local result = tools.run_todos({ action = "update", id = 1, status = "done" }, frame)
-      assert.are.match("Updated todo #1: %[done%] Test todo", result)
-    end)
-
-    it("should format todos", function()
-      tools.run_todos({ action = "add", text = "Test todo" }, frame)
-      assert.are.match("#1 %[pending%] Test todo", tools.format_todos(frame.todos))
-    end)
-  end)
-
   describe("run_notes", function()
     it("should write notes", function()
       local result = tools.run_notes({ action = "write", content = "Test note" }, frame)
@@ -284,11 +265,13 @@ describe("tools module", function()
 
     it("should render memory", function()
       frame.notes = "hello"
-      tools.run_todos({ action = "add", text = "t1" }, frame)
+      frame.steps = { { text = "look around", response = "found agent.lua" } }
       local mem = tools.render_memory(frame)
-      assert.are.match("Working memory", mem)
+      assert.are.match("CURRENT STATE", mem)
       assert.are.match("hello", mem)
-      assert.are.match("t1", mem)
+      assert.are.match("Goal:", mem)
+      assert.are.match("Previous steps:", mem)
+      assert.are.match("look around", mem)
     end)
   end)
 end)

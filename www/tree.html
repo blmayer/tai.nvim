@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>tai tree ec91ede</title>
+<title>tai tree 696e2f9</title>
 <meta name="color-scheme" content="light dark">
 <link rel=icon href=data:,>
 <style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
@@ -9,46 +9,50 @@
 
 <a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
 
-commit <a href=commit-ec91ede.html>ec91ede</a>
-Redeploy index.html with log/tree/refs links.
+commit <a href=commit-696e2f9.html>696e2f9</a>
+minor updates
 
 size    perm    path                                
 ------  ------  ------------------------------------
    265  100644  .gitignore                          
    583  100644  .luacheckrc                         
-    29  100644  .tai                                
+    88  100644  .tai                                
    114  100644  .tai.bak                            
-    3K  100644  AGENTS.md                           
+    4K  100644  AGENTS.md                           
     1K  100644  LICENSE                             
    963  100644  Makefile                            
-    9K  100644  README.md                           
+   10K  100644  README.md                           
    421  100644  TODO.md                             
-    6K  100644  lua/tai/agent.lua                   
+    5K  100644  lua/tai/agent.lua                   
     3K  100644  lua/tai/config.lua                  
     4K  100644  lua/tai/context.lua                 
-   892  100644  lua/tai/init.lua                    
+    1K  100644  lua/tai/init.lua                    
    270  100644  lua/tai/library.lua                 
     1K  100644  lua/tai/log.lua                     
+   25K  100644  lua/tai/mcp.lua                     
    10K  100644  lua/tai/provider_common.lua         
    23K  100644  lua/tai/providers.lua               
    11K  100644  lua/tai/skills.lua                  
-    3K  100644  lua/tai/spec/config_spec.lua        
+    4K  100644  lua/tai/spec/config_spec.lua        
     9K  100644  lua/tai/spec/tools_spec.lua         
      0  100644  lua/tai/spec/tools_test.lua         
     1K  100644  lua/tai/tests/README.md             
    10K  100644  lua/tai/tests/edit_test.lua         
+    3K  100755  lua/tai/tests/fixtures/dummy_mcp_ser
+    4K  100644  lua/tai/tests/mcp_test.lua          
     1K  100644  lua/tai/tests/rate_estimator_test.lu
     3K  100644  lua/tai/tests/subtask_test.lua      
     9K  100644  lua/tai/tools.lua                   
     5K  100644  lua/tai/tools/edit.lua              
     5K  100644  lua/tai/tools/io.lua                
+   389  100644  lua/tai/tools/mcp.lua               
     1K  100644  lua/tai/tools/shell.lua             
    905  100644  lua/tai/tools/skill.lua             
     5K  100644  lua/tai/tools/subtask.lua           
     2K  100644  lua/tai/ui.lua                      
-   26K  100644  lua/tai/ui/core.lua                 
+   28K  100644  lua/tai/ui/core.lua                 
     3K  100644  lua/tai/ui/session.lua              
-    8K  100644  lua/tai/ui/tools.lua                
+    9K  100644  lua/tai/ui/tools.lua                
     1K  100644  plugin/tai.lua                      
   289K  100644  www/2025-08-05-174307_1372x1415_scro
   278K  100644  www/2025-08-05-174401_1372x1415_scro
@@ -104,6 +108,7 @@ size    perm    path
    990  100644  www/commit-524b63f.html             
    876  100644  www/commit-525fc71.html             
     4K  100644  www/commit-53616c9.html             
+    1K  100644  www/commit-537ac7c.html             
    12K  100644  www/commit-54c20f0.html             
    14K  100644  www/commit-56910b5.html             
    973  100644  www/commit-5713ef0.html             
@@ -137,6 +142,7 @@ size    perm    path
     2K  100644  www/commit-78a505c.html             
     4K  100644  www/commit-78d44d4.html             
     7K  100644  www/commit-7af777f.html             
+    2M  100644  www/commit-7c1c1fa.html             
    22K  100644  www/commit-7e4d9b5.html             
     8K  100644  www/commit-80741b5.html             
     1K  100644  www/commit-81326cd.html             
@@ -215,6 +221,7 @@ size    perm    path
    13K  100644  www/commit-ea357c4.html             
    18K  100644  www/commit-ec27a7b.html             
     7K  100644  www/commit-ec33371.html             
+    1K  100644  www/commit-ec91ede.html             
    27K  100644  www/commit-ed3fa2a.html             
     3K  100644  www/commit-ee5ac47.html             
    915  100644  www/commit-f29f3f9.html             
@@ -292,6 +299,7 @@ size    perm    path
     1K  100644  www/tree-524b63f.html               
     1K  100644  www/tree-525fc71.html               
     1K  100644  www/tree-53616c9.html               
+   21K  100644  www/tree-537ac7c.html               
     2K  100644  www/tree-54c20f0.html               
     1K  100644  www/tree-56910b5.html               
     1K  100644  www/tree-5713ef0.html               
@@ -325,6 +333,7 @@ size    perm    path
     1K  100644  www/tree-78a505c.html               
     2K  100644  www/tree-78d44d4.html               
     1K  100644  www/tree-7af777f.html               
+   21K  100644  www/tree-7c1c1fa.html               
     2K  100644  www/tree-7e4d9b5.html               
     1K  100644  www/tree-80741b5.html               
     1K  100644  www/tree-81326cd.html               
@@ -403,6 +412,7 @@ size    perm    path
     1K  100644  www/tree-ea357c4.html               
     2K  100644  www/tree-ec27a7b.html               
     1K  100644  www/tree-ec33371.html               
+   21K  100644  www/tree-ec91ede.html               
     2K  100644  www/tree-ed3fa2a.html               
    985  100644  www/tree-ee5ac47.html               
     1K  100644  www/tree-f29f3f9.html               
