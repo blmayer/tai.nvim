@@ -7,6 +7,9 @@ local config = require("tai.config")
 M.limit_output = tools_io.limit_output
 
 function M.unsafe_command(cmd)
+	if type(cmd) ~= "string" or cmd == "" then
+		return "missing command"
+	end
 	log.debug("Running `" .. cmd .. "`")
 
 	-- Check for disallowed redirect operators.
@@ -39,6 +42,9 @@ function M.unsafe_command(cmd)
 end
 
 function M.exec_command(cmd)
+	if type(cmd) ~= "string" or cmd == "" then
+		return "missing command"
+	end
 	log.debug("Executing `" .. cmd .. "`")
 
 	local env = {}

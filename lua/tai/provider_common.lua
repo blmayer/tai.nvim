@@ -30,6 +30,10 @@ function M.build_request_tools(api_format, tool_list)
 	local request_tools = {}
 
 	-- Add local tools based on API format
+	if type(tool_list) ~= "table" then
+		tool_list = {}
+	end
+
 	if api_format == "responses" then
 		-- OpenAI Responses API: tools need `name` at top level
 		local function to_responses_tool(def)
@@ -44,12 +48,18 @@ function M.build_request_tools(api_format, tool_list)
 		end
 
 		for _, tool in ipairs(tool_list) do
-			table.insert(request_tools, to_responses_tool(tools.defs[tool]))
+			local def = tools.defs[tool]
+			if def then
+				table.insert(request_tools, to_responses_tool(def))
+			end
 		end
 	else
 		-- Chat Completions API: use standard tool format
 		for _, tool in ipairs(tool_list) do
-			table.insert(request_tools, tools.defs[tool])
+			local def = tools.defs[tool]
+			if def then
+				table.insert(request_tools, def)
+			end
 		end
 	end
 

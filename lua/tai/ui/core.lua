@@ -146,11 +146,28 @@ local function format_edit_fold(old_text, new_text, result)
 	return table.concat(parts, "\n")
 end
 
+local function worker_history(frame)
+	local goal = tools_subtask.frame_goal(frame)
+	local hist = { { role = "system", content = frame.system_prompt or "" } }
+	if goal ~= "" then
+		table.insert(hist, { role = "user", content = goal })
+	end
+	return hist
+end
+
 local function prepare_messages(frame)
-	local msgs = vim.deepcopy(frame.history)
+	-- Isolated workers always start from scratch: system + goal only.
+	local msgs = frame.isolated and worker_history(frame) or vim.deepcopy(frame.history)
 	if msgs[1] and msgs[1].role == "system" then
 		local parts = { frame.system_prompt }
-		-- Main already has the full chat; only isolated workers need Goal/steps.
+		local tool_section = agent.render_tools(frame.tools)
+		if tool_section ~= "" then
+			table.insert(parts, tool_section)
+		end
+		local notes = tools_subtask.render_notes()
+		if notes ~= "" then
+			table.insert(parts, notes)
+		end
 		if frame.isolated then
 			local live = tools_subtask.render_memory(frame)
 			if live ~= "" then
@@ -244,6 +261,7 @@ local function save_session()
 	end
 	local ok = context.save({
 		stack = stack,
+		notes = tools_subtask.get_notes(),
 		last_ctx = get_agent_ctx(),
 		chat_lines = get_chat_lines(),
 	}, config.context)
@@ -404,7 +422,7 @@ local function scroll_down()
 	end)
 end
 
-local function add_sep(title)
+local function add_sep(title, depth)
 	local width = 80
 	if chat_win and vim.api.nvim_win_is_valid(chat_win) then
 		width = vim.api.nvim_win_get_width(chat_win)
@@ -413,7 +431,7 @@ local function add_sep(title)
 	for _ = 1, math.max(0, width - #title) do
 		result = result .. "_"
 	end
-	M.append("\n" .. result .. "\n")
+	M.append("\n" .. result .. "\n", depth)
 end
 
 local function run_live_shell(command, on_done, depth)
@@ -533,17 +551,19 @@ local function finish_oneshot(frame, assistant_text, status)
 		end
 	end
 	local outcome = tools_subtask.outcome_for(frame, assistant_text)
-	if not frame._printed_content and outcome and outcome ~= "" and outcome ~= "(no output)" then
-		M.append("\n" .. outcome .. "\n", nest_depth(frame))
+	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
+		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
 	end
+	local close_depth = nest_depth(frame)
+	if close_depth > 0 then
+		close_depth = close_depth - 1
+	end
+	add_sep("___ END ", close_depth)
 	if top() == frame then
 		table.remove(stack)
 	end
 	local report = tools_subtask.format_complete(status, outcome, frame)
 	local parent = top()
-	if parent then
-		report = tools_subtask.cap_report(report, 800)
-	end
 	if parent then
 		parent.steps = parent.steps or {}
 		table.insert(parent.steps, {
@@ -561,7 +581,8 @@ local function finish_oneshot(frame, assistant_text, status)
 		resume(report)
 		return true
 	end
-	if parent and frame.parent_call_id then
+	-- Main keeps tool results in chat history. Isolated parents stay at goal-only.
+	if parent and frame.parent_call_id and not parent.isolated then
 		table.insert(parent.history, {
 			role = "tool",
 			name = "subtask",
@@ -583,10 +604,13 @@ local function after_tool_round(frame, stop)
 	if stop then
 		return
 	end
-	-- Workers iterate only after a subtask returns. Work tools end the turn.
+	-- Nested subtask sets continue_after_tools. Work tools end this worker.
 	if is_worker() and not frame.continue_after_tools then
 		finish_oneshot(frame, frame.last_assistant)
 		return
+	end
+	if frame.isolated then
+		frame.history = worker_history(frame)
 	end
 	M.continue()
 end
@@ -618,6 +642,20 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 	local history = frame.history
 	local depth = nest_depth(frame)
 	frame.continue_after_tools = false
+
+	if type(tool_calls) == "table" and #tool_calls > 1 then
+		for i = 2, #tool_calls do
+			local extra = tool_calls[i]
+			local fn = extra["function"] or {}
+			table.insert(history, {
+				role = "tool",
+				name = fn.name,
+				tool_call_id = extra.id,
+				content = "Only one tool call per turn. Ignored.",
+			})
+		end
+		tool_calls = { tool_calls[1] }
+	end
 
 	if start_index == 1 then
 		M.append("\n", depth)
@@ -656,29 +694,47 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			process_from(i + 1)
 		end
 
+		if not agent.tool_granted(frame.tools, name) then
+			local granted = table.concat(frame.tools or {}, ", ")
+			if granted == "" then
+				granted = "(none)"
+			end
+			M.append("tool denied: " .. tostring(name) .. "\n", depth)
+			res.content = "Tool `" .. tostring(name) .. "` is not granted. Granted: "
+				.. granted .. ". Call subtask and pass the tool if a child needs it."
+			finish_one()
+			return
+		end
+
 		if name == "shell" then
-			local unsafe = tools_shell.unsafe_command(args.command)
-			if not unsafe or config.auto_approve then
-				M.append("shell: " .. args.command .. "\n{{{\n", depth)
-				current_state = "tools"
-				update_input_name()
-				run_live_shell(args.command, function(out)
-					res.content = tools_io.limit_output(out, "shell")
-					M.append((out or "") .. "\n}}}\n", depth)
-					refresh_and_close_folds()
-					finish_one()
-				end, depth)
+			local command = args.command
+			if type(command) ~= "string" or command == "" then
+				M.append("shell: missing command\n", depth)
+				res.content = "missing command field"
+			else
+				local unsafe = tools_shell.unsafe_command(command)
+				if not unsafe or config.auto_approve then
+					M.append("shell: " .. command .. "\n{{{\n", depth)
+					current_state = "tools"
+					update_input_name()
+					run_live_shell(command, function(out)
+						res.content = tools_io.limit_output(out, "shell")
+						M.append((out or "") .. "\n}}}\n", depth)
+						refresh_and_close_folds()
+						finish_one()
+					end, depth)
+					return
+				end
+				local tcs = {}
+				for j = i, #calls do
+					table.insert(tcs, calls[j])
+				end
+				pending_tools = tcs
+				M.append("Run `" .. command .. "`? (y/n/s) ", depth)
+				M.focus_input()
+				on_done(true)
 				return
 			end
-			local tcs = {}
-			for j = i, #calls do
-				table.insert(tcs, calls[j])
-			end
-			pending_tools = tcs
-			M.append("Run `" .. args.command .. "`? (y/n/s) ", depth)
-			M.focus_input()
-			on_done(true)
-			return
 		elseif name == "read" then
 			if not args.file then
 				M.append("read: missing file\n", depth)
@@ -736,61 +792,55 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 				goal = nil
 			end
 			local parent_goal = tools_subtask.frame_goal(frame)
-			local norm = function(s)
-				s = tostring(s or ""):lower()
-				s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-				return s
-			end
 			if first_sub and i ~= first_sub then
 				M.append("subtask skipped: only one per turn\n", depth)
 				res.content = "Only one subtask per turn. Wait for this step, then continue."
 			elseif not goal or goal == "" then
 				M.append("subtask failed: no goal\n", depth)
 				res.content = "missing goal"
-			elseif parent_goal ~= "" and norm(goal) == norm(parent_goal) then
+			elseif parent_goal ~= "" and tools_subtask.same_goal(parent_goal, goal) then
 				M.append("subtask failed: goal copies the current Goal\n", depth)
-				res.content = "goal must be a more specific next step, not a copy of the current Goal"
+				res.content = "goal must be a more specific next step, not a copy of the current Goal: "
+					.. goal
 			elseif #stack >= (agent.MAX_DEPTH or 8) then
 				M.append("subtask failed: max depth\n", depth)
 				res.content = "max subtask depth reached"
 			else
-				local child_tools
-				if type(args.tools) == "table" and #args.tools > 0 then
-					child_tools = agent.sanitize_subtask_tools(args.tools)
-				else
-					child_tools = vim.deepcopy(agent.subtask_tools)
+				local child_tools = agent.sanitize_subtask_tools(args.tools)
+				local child_depth = #stack
+				M.append("SUBTASK " .. goal .. "\n", depth)
+				M.append("tools: " .. table.concat(child_tools, ", ") .. "\n", child_depth)
+				local child = agent.new_frame({
+					profile = "subtask",
+					system_prompt = args.system_prompt,
+					tools = child_tools,
+					goal = goal,
+					depth = child_depth,
+					parent_call_id = call.id,
+				})
+				child.on_parent_resume = function(report)
+					frame.continue_after_tools = true
+					res.content = report
+					finish_one()
 				end
-				if #child_tools == 0 then
-					M.append("subtask failed: no valid tools\n", depth)
-					res.content = "no valid tools"
-				else
-					local child_depth = #stack
-					M.append("\nSUBTASK " .. goal .. "\n", depth)
-					local child = agent.new_frame({
-						profile = "subtask",
-						system_prompt = args.system_prompt,
-						tools = child_tools,
-						goal = goal,
-						depth = child_depth,
-						parent_call_id = call.id,
-					})
-					child.on_parent_resume = function(report)
-						frame.continue_after_tools = true
-						res.content = report
-						finish_one()
-					end
-					table.insert(stack, child)
-					M.update_chat_name()
-					update_input_name()
-					maybe_auto_save()
-					M.continue()
-					return
-				end
+				table.insert(stack, child)
+				M.update_chat_name()
+				update_input_name()
+				maybe_auto_save()
+				M.continue()
+				return
 			end
 		elseif name == "notes" then
-			local out = tools_subtask.run_notes(args, frame)
+			local out = tools_subtask.run_notes(args)
 			res.content = out
-			M.append("notes: " .. out .. "\n", depth)
+			-- Notes is briefing, not work. Keep the worker so it can subtask next.
+			frame.continue_after_tools = true
+			local body = tools_subtask.get_notes()
+			if body ~= "" then
+				append_output("notes: " .. (args.action or "?"), body, depth)
+			else
+				M.append("notes: " .. out .. "\n", depth)
+			end
 		elseif name == "skill" then
 			local out = tools_skill.run(args)
 			res.content = out
@@ -873,10 +923,11 @@ function M.send_input()
 			local depth = nest_depth(frame)
 			M.append(input .. "\n", depth)
 
+			local command = args.command
 			if response == "y" or response == "yes" then
 				M.append("Confirmed...\n", depth)
-				M.append("shell: " .. args.command .. "\n{{{\n", depth)
-				run_live_shell(args.command, function(out)
+				M.append("shell: " .. tostring(command) .. "\n{{{\n", depth)
+				run_live_shell(command, function(out)
 					res.content = tools_io.limit_output(out, "shell")
 					M.append((out or "") .. "\n}}}\n", depth)
 					refresh_and_close_folds()
@@ -890,7 +941,7 @@ function M.send_input()
 				return
 			elseif response == "s" or response == "stop" then
 				M.append("Stopped\n", depth)
-				M.append("shell stopped: " .. args.command .. "\n", depth)
+				M.append("shell stopped: " .. tostring(command) .. "\n", depth)
 				hard_stop = true
 				res.content = "User stopped execution."
 				record_tool_output(frame, res.content)
@@ -902,7 +953,7 @@ function M.send_input()
 				maybe_auto_save()
 				return
 			else
-				M.append("shell declined: " .. args.command .. "\n", depth)
+				M.append("shell declined: " .. tostring(command) .. "\n", depth)
 				res.content = "User declined running this command: " .. input
 				record_tool_output(frame, res.content)
 				table.insert(history, res)
@@ -923,6 +974,9 @@ function M.send_input()
 		end
 
 		add_sep("___ " .. nest_label(frame) .. " ")
+		if frame.tools and #frame.tools > 0 then
+			M.append("tools: " .. table.concat(frame.tools, ", ") .. "\n", nest_depth(frame))
+		end
 		maybe_auto_save()
 		M.continue()
 		update_input_name()
@@ -986,6 +1040,7 @@ end
 function M.clear()
 	vim.api.nvim_buf_set_lines(M.buffer_nr, 0, -1, false, {})
 	stack = { agent.new_frame({ profile = "main" }) }
+	tools_subtask.set_notes("")
 	pending_tools = nil
 	pcall(function()
 		providers_factory.cancel_pending_waits()

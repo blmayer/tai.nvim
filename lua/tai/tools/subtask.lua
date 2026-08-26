@@ -2,20 +2,6 @@ local M = {}
 local log = require("tai.log")
 local skills = require("tai.skills")
 
-local function split_lines(s)
-	if type(s) ~= "string" then
-		return { tostring(s) }
-	end
-	if vim and vim.split then
-		return vim.split(s, "\n", { plain = true })
-	end
-	local out = {}
-	for line in (s .. "\n"):gmatch("(.-)\n") do
-		table.insert(out, line)
-	end
-	return out
-end
-
 function M.frame_goal(frame)
 	frame = frame or {}
 	if type(frame.goal) == "string" and frame.goal ~= "" then
@@ -30,6 +16,33 @@ function M.frame_goal(frame)
 	return ""
 end
 
+--- True when `child` is the same job as `parent` with different wording.
+function M.same_goal(parent, child)
+	local function core(s)
+		s = tostring(s or ""):lower()
+		s = s:gsub("[\"'`]", "")
+		s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+		s = s:gsub("%s+to%s+.*$", "")
+		s = s:gsub("%s+and%s+.*$", "")
+		s = s:gsub("%s+so%s+that%s+.*$", "")
+		s = s:gsub("%s+so%s+.*$", "")
+		s = s:gsub("%.$", "")
+		return s
+	end
+	local a, b = core(parent), core(child)
+	if a == "" or b == "" then
+		return false
+	end
+	if a == b then
+		return true
+	end
+	-- One restates the other with extra trailing purpose.
+	if #a >= 24 and #b >= 24 and (a:find(b, 1, true) or b:find(a, 1, true)) then
+		return true
+	end
+	return false
+end
+
 local function trim_text(s)
 	if s == nil or s == vim.NIL then
 		return ""
@@ -40,33 +53,8 @@ local function trim_text(s)
 	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
---- Work tools end the turn before the child can summarize, so the
---- parent must receive a compact slice of the tool result.
-function M.compact_tool_outputs(frame, max_chars)
-	max_chars = max_chars or 700
-	local parts = (frame and frame.tool_outputs) or {}
-	if #parts == 0 then
-		return nil
-	end
-	local text = table.concat(parts, "\n\n")
-	if text == "" then
-		return nil
-	end
-	if #text <= max_chars then
-		return text
-	end
-	local keep = math.floor((max_chars - 8) / 2)
-	return text:sub(1, keep) .. "\n[...]\n" .. text:sub(-keep)
-end
-
 local function is_weak_reply(s)
 	if s == "" then
-		return true
-	end
-	if s:match("[Oo]utcome:") or s:match("[Ff]ound:") then
-		return false
-	end
-	if #s < 80 then
 		return true
 	end
 	if s:match("^I'll ") or s:match("^I will ") or s:match("^Let me ")
@@ -78,11 +66,12 @@ end
 
 function M.outcome_for(frame, assistant_text)
 	local assistant = trim_text(assistant_text)
-	local tools = M.compact_tool_outputs(frame)
+	local parts = (frame and frame.tool_outputs) or {}
+	local tools = #parts > 0 and table.concat(parts, "\n\n") or ""
 	if assistant ~= "" and not is_weak_reply(assistant) then
 		return assistant
 	end
-	if tools then
+	if tools ~= "" then
 		return tools
 	end
 	if assistant ~= "" then
@@ -91,106 +80,57 @@ function M.outcome_for(frame, assistant_text)
 	return "(no output)"
 end
 
---- True when a child pasted fenced evidence instead of a fact summary.
-function M.looks_like_dump(text)
-	if type(text) ~= "string" or text == "" then
-		return false
-	end
-	return text:match("{{{") ~= nil or text:match("```") ~= nil
-end
-
---- Keep only a parent-usable handoff. Dumps become a retry signal.
-function M.summarize_handoff(text)
-	if type(text) ~= "string" or text == "" then
-		return text
-	end
-	if not M.looks_like_dump(text) then
-		return text
-	end
-	local found = text:match("[Ff]ound:%s*([^\n]+)")
-	if found then
-		found = found:match("^%s*(.-)%s*$")
-	end
-	if not found or found == "" or #found > 200 then
-		found = "none"
-	end
-	return table.concat({
-		"found: " .. found,
-		"outcome: reply was a dump (code or tool output). Ask for the specific fact again.",
-	}, "\n")
-end
-
---- Cap a handoff so coordinators (especially main) stay high-level.
 function M.cap_report(text, max_chars)
 	if type(text) ~= "string" or text == "" then
 		return text
 	end
-	max_chars = max_chars or 800
+	max_chars = max_chars or 600
 	if #text <= max_chars then
 		return text
 	end
-	return text:sub(1, max_chars)
-		.. "\n[truncated] Report was too long. Ask again for found:/outcome: only."
+	return text:sub(1, max_chars) .. "\n[truncated]"
 end
 
-local function step_is_error(step)
-	if not step then
-		return false
-	end
-	if step.status == "error" then
-		return true
-	end
-	local resp = step.response
-	return type(resp) == "string"
-		and (resp:match("^ERROR ") or resp:match("^status: error"))
-end
-
---- Short steering line from progress so far (request-ephemeral).
-function M.next_step_hint(frame)
-	frame = frame or {}
-	local steps = frame.steps or {}
-	if #steps == 0 then
-		return "No progress yet. First: list the project dir and read README.md / AGENTS.md."
-	end
-	if step_is_error(steps[#steps]) then
-		return "Last step failed. Next: inspect that failure only."
-	end
-	return "Continue from the last report. Do not repeat a finished step."
-end
-
---- Goal + same-level previous steps (request-ephemeral data only).
+--- Same-level previous steps (request-ephemeral). Goal stays the user message.
 function M.format_progress(frame)
 	frame = frame or {}
-	local goal = M.frame_goal(frame)
-	local lines = {
-		"Goal:",
-		goal ~= "" and goal or "(none)",
-		"",
-		"Previous steps:",
-	}
 	local steps = frame.steps or {}
-	-- Main stays high-level; workers may keep a bit more.
-	local cap = frame.isolated and 800 or 400
 	if #steps == 0 then
-		table.insert(lines, "(none)")
-	else
-		for i, step in ipairs(steps) do
-			local tag = step_is_error(step) and " [error]" or ""
-			table.insert(lines, string.format("%d. %s%s", i, step.text or "", tag))
-			local resp = step.response
-			if type(resp) == "string" and resp ~= "" then
-				resp = M.cap_report(resp, cap)
-				for _, rl in ipairs(split_lines(resp)) do
-					table.insert(lines, "   " .. rl)
-				end
+		return ""
+	end
+	local lines = { "Previous steps at this level:" }
+	local start = 1
+	if #steps > 8 then
+		start = #steps - 7
+		table.insert(lines, "(earlier steps omitted)")
+	end
+	for i = start, #steps do
+		local step = steps[i]
+		table.insert(lines, string.format("%d. %s", i, step.text or ""))
+		local resp = step.response
+		if type(resp) == "string" and resp ~= "" then
+			resp = M.cap_report(resp, 600)
+			for line in (resp .. "\n"):gmatch("(.-)\n") do
+				table.insert(lines, "   " .. line)
 			end
 		end
 	end
-	table.insert(lines, "")
-	table.insert(lines, "Now:")
-	table.insert(lines, M.next_step_hint(frame))
-	table.insert(lines, "Handoff: found: + outcome: only. Parent cannot see your tools.")
 	return table.concat(lines, "\n")
+end
+
+-- Shared notepad for the whole stack (main + every worker).
+local notes_text = ""
+
+function M.get_notes()
+	return notes_text
+end
+
+function M.set_notes(text)
+	if text == nil or text == vim.NIL then
+		notes_text = ""
+		return
+	end
+	notes_text = tostring(text)
 end
 
 --- Truncate notes for injection (head + tail).
@@ -209,25 +149,43 @@ function M.format_notes(notes, max_chars)
 		.. notes:sub(#notes - half + 1)
 end
 
+--- Shared notes block injected into every request (never stored in history).
+function M.render_notes()
+	local notes = M.format_notes(notes_text)
+	if notes == "" then
+		return ""
+	end
+	return table.concat({
+		"========== NOTES ==========",
+		"",
+		notes,
+		"",
+		"========== END NOTES ==========",
+	}, "\n")
+end
+
 --- Live context injected into the system prompt each request (never stored in history).
---- Returns "" when empty so callers can skip injection.
+--- Isolated workers have no chat history; this is how they see sibling step reports.
 function M.render_memory(frame)
 	frame = frame or {}
-	local inner = { M.format_progress(frame) }
-	local notes = M.format_notes(frame.notes)
-	if notes ~= "" then
-		table.insert(inner, "Notes:\n" .. notes)
+	local parts = {}
+	local progress = M.format_progress(frame)
+	if progress ~= "" then
+		table.insert(parts, progress)
 	end
 	local loaded = skills.render_loaded()
 	if loaded ~= "" then
-		table.insert(inner, "Loaded skills:\n" .. loaded)
+		table.insert(parts, "Loaded skills:\n" .. loaded)
+	end
+	if #parts == 0 then
+		return ""
 	end
 	return table.concat({
-		"========== CURRENT STATE ==========",
+		"========== LIVE CONTEXT ==========",
 		"",
-		table.concat(inner, "\n\n"),
+		table.concat(parts, "\n\n"),
 		"",
-		"========== END CURRENT STATE ==========",
+		"========== END LIVE CONTEXT ==========",
 	}, "\n")
 end
 
@@ -238,9 +196,6 @@ end
 --- Payload returned to parent when a worker finishes.
 function M.format_complete(status, summary, frame)
 	local outcome = summary or M.outcome_for(frame, nil)
-	if status ~= "error" and not is_error_text(outcome) then
-		outcome = M.summarize_handoff(outcome)
-	end
 	local step = frame and frame.goal or "?"
 	if status == "error" or is_error_text(outcome) then
 		return table.concat({
@@ -259,23 +214,22 @@ function M.format_complete(status, summary, frame)
 end
 
 --- @param args table
---- @param frame table agent frame with notes string
-function M.run_notes(args, frame)
+function M.run_notes(args)
 	local action = args.action
 	if action == "write" then
 		if not args.content then
 			return "Error: 'content' is required for 'write'"
 		end
-		frame.notes = args.content
+		notes_text = args.content
 		return string.format("Notes updated (%d chars).", #args.content)
 	elseif action == "append" then
 		if not args.content then
 			return "Error: 'content' is required for 'append'"
 		end
-		if frame.notes == "" then
-			frame.notes = args.content
+		if notes_text == "" then
+			notes_text = args.content
 		else
-			frame.notes = frame.notes .. "\n" .. args.content
+			notes_text = notes_text .. "\n" .. args.content
 		end
 		return string.format("Notes appended (%d chars).", #args.content)
 	end

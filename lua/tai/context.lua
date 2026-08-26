@@ -22,7 +22,7 @@ function M.ensure_cache_dir(dir)
 	if stat and stat.type == "directory" then
 		return true
 	end
-	if vim.fn.mkdir(dir, "p") == 0 then
+	if vim.fn.mkdir(dir, "p") ~= 0 then
 		return false, "mkdir failed for " .. dir
 	end
 	return true
@@ -95,7 +95,7 @@ function M.load(config)
 	return data
 end
 
---- state: { stack, last_ctx?, chat_lines? } (legacy planner/coder fields also accepted on load)
+--- state: { stack, notes?, last_ctx?, chat_lines? } (legacy planner/coder fields also accepted on load)
 function M.save(state, config)
 	config = config or M.default_config
 	if not config.enabled then
@@ -113,6 +113,7 @@ function M.save(state, config)
 
 	local context_data = {
 		stack = state.stack,
+		notes = state.notes,
 		last_ctx = state.last_ctx,
 		chat_lines = state.chat_lines,
 		saved_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),

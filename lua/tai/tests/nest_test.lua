@@ -44,17 +44,17 @@ local function step(text, depth)
 	local head = buf:sub(1, #buf - #last)
 	buf = head .. nest.apply(text, depth, last)
 end
-step("\nSUBTASK search\n", 0)
+step("SUBTASK search\n", 0)
 step("I'll look around\n", 1)
 step("shell: find . -name '*.lua'\n{{{\n", 1)
 step("lua/tai/init.lua\n", 1)
 step("}}}\n", 1)
 step("Found init.lua\n", 1)
-step("\nSUBTASK summarize\n", 1)
+step("\n___ END _______________________________________________________________\n", 0)
+step("SUBTASK summarize\n", 1)
 step("It is the entrypoint\n", 2)
 
 local expect = table.concat({
-	"",
 	"SUBTASK search",
 	"    I'll look around",
 	"    shell: find . -name '*.lua'",
@@ -63,6 +63,7 @@ local expect = table.concat({
 	"    }}}",
 	"    Found init.lua",
 	"",
+	"___ END _______________________________________________________________",
 	"    SUBTASK summarize",
 	"        It is the entrypoint",
 	"",
@@ -72,21 +73,20 @@ assert_eq(expect, buf, "full tree")
 print("\n=== nest.apply 3-level (sub-subtask) ===")
 buf = ""
 -- Same calls as run_tools: header at parent depth, body at child depth.
-step("\nSUBTASK search\n", 0) -- main → child
+step("SUBTASK search\n", 0) -- main → child
 step("orient done\n", 1)
-step("\nSUBTASK list lua/tai\n", 1) -- child → grandchild
+step("SUBTASK list lua/tai\n", 1) -- child → grandchild
 step("shell: ls lua/tai\n{{{\n", 2)
 step("agent.lua\nui\n", 2)
 step("}}}\n", 2)
 step("found: lua/tai/agent.lua\n", 2)
-step("\nSUBTASK read agent.lua\n", 2) -- grandchild → great-grandchild
+step("\n___ END _______________________________________________________________\n", 1)
+step("SUBTASK read agent.lua\n", 2) -- grandchild → great-grandchild
 step("main_tools is subtask only\n", 3)
 
 local expect3 = table.concat({
-	"",
 	"SUBTASK search",
 	"    orient done",
-	"",
 	"    SUBTASK list lua/tai",
 	"        shell: ls lua/tai",
 	"        {{{",
@@ -95,6 +95,7 @@ local expect3 = table.concat({
 	"        }}}",
 	"        found: lua/tai/agent.lua",
 	"",
+	"    ___ END _______________________________________________________________",
 	"        SUBTASK read agent.lua",
 	"            main_tools is subtask only",
 	"",

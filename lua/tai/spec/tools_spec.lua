@@ -42,7 +42,8 @@ local mock_io_open = {
 describe("tools module", function()
   local frame
   before_each(function()
-    frame = { notes = "", goal = "do the thing", steps = {} }
+    frame = { goal = "do the thing", steps = {} }
+    tools.set_notes("")
     -- Reset config state
     config.allowed_commands = nil
   end)
@@ -251,27 +252,27 @@ describe("tools module", function()
 
   describe("run_notes", function()
     it("should write notes", function()
-      local result = tools.run_notes({ action = "write", content = "Test note" }, frame)
+      local result = tools.run_notes({ action = "write", content = "Test note" })
       assert.are.match("Notes updated", result)
-      assert.are.equal("Test note", frame.notes)
+      assert.are.equal("Test note", tools.get_notes())
     end)
 
     it("should append notes", function()
-      frame.notes = "Initial note"
-      local result = tools.run_notes({ action = "append", content = "Appended note" }, frame)
+      tools.set_notes("Initial note")
+      local result = tools.run_notes({ action = "append", content = "Appended note" })
       assert.are.match("Notes appended", result)
-      assert.are.equal("Initial note\nAppended note", frame.notes)
+      assert.are.equal("Initial note\nAppended note", tools.get_notes())
     end)
 
     it("should render memory", function()
-      frame.notes = "hello"
+      tools.set_notes("hello")
       frame.steps = { { text = "look around", response = "found agent.lua" } }
       local mem = tools.render_memory(frame)
-      assert.are.match("CURRENT STATE", mem)
-      assert.are.match("hello", mem)
-      assert.are.match("Goal:", mem)
-      assert.are.match("Previous steps:", mem)
+      local notes = tools.render_notes()
       assert.are.match("look around", mem)
+      assert.are.match("found agent.lua", mem)
+      assert.are.match("NOTES", notes)
+      assert.are.match("hello", notes)
     end)
   end)
 end)

@@ -353,7 +353,7 @@ local function create_provider_module(provider_name)
 			}
 
 			if config.use_tools ~= false then
-				body.tools = common.build_request_tools("responses")
+				body.tools = common.build_request_tools("responses", model_config.tools)
 			end
 
 			if model_config.options then
@@ -493,7 +493,7 @@ local function create_provider_module(provider_name)
 			}
 
 			if config.use_tools ~= false then
-				body.tools = common.build_request_tools("responses")
+				body.tools = common.build_request_tools("responses", model_config.tools)
 			end
 
 			if model_config.options then

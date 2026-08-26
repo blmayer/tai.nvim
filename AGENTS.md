@@ -28,23 +28,31 @@ These notes are intended for **automated coding agents** working in this reposit
 
 ```
 stack[1] = MAIN frame (history + goal + steps; multi-turn; tool: subtask)
-stack[2+] = isolated SUBTASK (clean history, goal, tools, steps)
+stack[2+] = isolated SUBTASK (history = goal only; steps in system prompt)
 
 each frame.steps = completed sibling steps at that level
   { text = child goal, response = child outcome }
 
 each request (ephemeral):
   system = base_prompt
+         + granted / grantable tools
+         + NOTES (shared pad)
+         + LIVE CONTEXT (previous steps at this level; isolated only)
          + MCP Servers state
-         + CURRENT STATE: Goal + Previous steps
 
-if you can answer, do it; else subtask until you can answer.
-a worker iterates only after `subtask` returns (work tools end the turn).
+answer if the goal is fully addressed, else subtask one step.
+notes is the shared channel between agents.
+when a child returns, the parent is asked again.
 it does not see the user's chat; its final text is the step response.
 ```
 
-- Main tools: `subtask` only
-- Child tools: those listed in `subtask.tools` (default: read/edit/shell/subtask/…)
+- Main tools: `subtask`, `notes`
+- Child tools: those listed in `subtask.tools` (default: `subtask`, `notes`)
+- Pass read/shell/edit for a one-shot leaf. Omit `tools` to make a coordinator.
+- `run_tools` rejects names not on the frame allowlist (models can still hallucinate tools).
+- Notes are global (one pad for the stack) and injected every turn for main and workers
+- `notes` does not end a worker (briefing); work tools still end a leaf
+- Isolated workers see sibling step reports via Live Context, not chat history
 - Skills (Agent Skills spec): dirs under `~/.config/tai/skills/` and `<project>/.tai-skills/`, each with `SKILL.md`
   - Required frontmatter: `name` (1–64, `[a-z0-9-]+`, match dir name) + `description` (1–1024, non-empty)
   - Invalid skills are skipped; catalog = name+description; `skill` load injects markdown body only

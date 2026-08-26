@@ -32,8 +32,8 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  MAIN (multi-turn, subtask only)                             │
-│  Live Context: Goal + Previous steps                         │
+│  MAIN (multi-turn, subtask + notes)                          │
+│  Live Context: shared notes                                  │
 │                                                              │
 │   reply if done, else subtask(one concrete next step)        │
 │        │                                                     │
@@ -51,21 +51,22 @@
 
 **Rules of the harness:**
 
-1. No `todos` tool. Agents **reply** or call **`subtask`** (one per turn).
-2. Live Context is **request-time only**: Goal, then Previous steps (1. … 2. …)
-   at this level, then “what is the next step?”
-3. `subtask` takes a concrete `goal` (not a copy of the current Goal). The
-   child has a **clean history** and only gets another turn after `subtask`.
-   Work tools end that turn. Its final text is the step’s result.
-4. Max depth is 8. Children may spawn one more-specific subtask.
-5. Main is the orchestrator (`subtask` only). Work happens in subagents.
+1. No `todos` tool. Agents **answer** or call **`subtask`** (one step).
+2. Answer only if it fully addresses the goal. A subtask is one step
+   toward that goal.
+3. When a child returns, its report is injected into the parent’s system
+   prompt and the parent is asked again. The child’s final text is the result.
+4. Max depth is 8. A child may nest only if granted `subtask`. Pass a
+   `read`/`shell`/`edit` for a leaf; omit `tools` for a coordinator.
+   Ungranted tools are denied.
+5. Main is the orchestrator (`subtask` + shared `notes`). Work happens in subagents.
 
 ### Subtask tool parameters
 
 | Field | Required | Description |
 |---|---|---|
 | `goal` | yes | The next step (paths, action). Must not copy the current Goal |
-| `tools` | no | Tool names granted to the child (default: implementation set) |
+| `tools` | no | Child tools. Default is `subtask` + `notes`. Pass `read`/`shell`/`edit` for a leaf. |
 | `system_prompt` | no | Override the default worker prompt |
 
 Examples:
@@ -261,11 +262,11 @@ Example `.tai` file:
 | `edit` | Search-and-replace edit (`multi` flag supported) |
 | `write` | Create new files |
 | `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
-| `notes` | Write/append notes (auto-injected as Live Context; no read action) |
+| `notes` | Write/append the shared notepad (injected every turn for main and workers) |
 | `mcp` | MCP status / connect / disconnect / list_tools / call |
 
-Main agent gets only `subtask`. Subtasks get the tools listed in `tools`
-(default is the implementation set, including `subtask`).
+Main and default children get `subtask` + `notes`. Pass `read`/`shell`/`edit`
+in `tools` for a one-shot leaf.
 
 ### `mcp` tool
 

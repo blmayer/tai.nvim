@@ -19,6 +19,9 @@ M.image_data_url = tools_subtask.image_data_url
 
 -- Re-export helper functions
 M.format_notes = tools_subtask.format_notes
+M.get_notes = tools_subtask.get_notes
+M.set_notes = tools_subtask.set_notes
+M.render_notes = tools_subtask.render_notes
 M.render_memory = tools_subtask.render_memory
 M.format_complete = tools_subtask.format_complete
 M.run_notes = tools_subtask.run_notes
@@ -78,15 +81,18 @@ M.defs = {
 			name = "subtask",
 			description =
 			"Spawn an agent for one smaller next step, not the whole Goal. "
-				.. "`goal` is one verb + one target, and must ask for a short fact "
-				.. "(not file contents or command output). One subtask per turn.",
+				.. "The child starts empty: it sees only this goal, NOTES, and its own previous steps. "
+				.. "`goal` must be a self-contained brief (paths, names, what fact to return). "
+				.. "One tool call per turn.",
 			parameters = {
 				type = "object",
 				properties = {
 					goal = {
 						type = "string",
 						description =
-						"One action + one target, narrower than the current Goal. "
+						"The child's only briefing besides NOTES. "
+							.. "One action + one target, narrower than the current Goal. "
+							.. "Include every path, name, and constraint. "
 							.. "Say what fact to return (name, path, yes/no). "
 							.. "Do not ask the child to return code or dumps.",
 					},
@@ -94,8 +100,11 @@ M.defs = {
 						type = "array",
 						items = { type = "string" },
 						description =
-						"Tools for the child. Default is the implementation set "
-							.. "(read/edit/shell/subtask/…). Minimal set preferred.",
+						"Tools the child needs for its goal, not a copy of yours. "
+							.. "You may grant tools you cannot call. "
+							.. "Example: [\"shell\"] to grep, [\"read\"] to open a file. "
+							.. "If the child still needs more than one shot, also pass \"subtask\". "
+							.. "Omit for a coordinator (subtask+notes only).",
 					},
 					system_prompt = {
 						type = "string",
@@ -191,7 +200,9 @@ M.defs = {
 		["function"] = {
 			name = "notes",
 			description =
-			"Update this agent's notes (injected every turn). Actions: write (replace), append.",
+			"Shared pad injected every turn for every agent. They cannot see your chat. "
+				.. "Write short facts others need (paths, names, findings) before you spawn a child. "
+				.. "Actions: write (replace), append.",
 			parameters = {
 				type = "object",
 				properties = {
