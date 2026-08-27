@@ -8,6 +8,8 @@ local tools_io = require("tai.tools.io")
 local tools_shell = require("tai.tools.shell")
 local tools_edit = require("tai.tools.edit")
 local tools_subtask = require("tai.tools.subtask")
+local tools_plan = require("tai.tools.plan")
+local tools_changes = require("tai.tools.changes")
 local tools_skill = require("tai.tools.skill")
 local tools_mcp = require("tai.tools.mcp")
 local nest = require("tai.ui.nest")
@@ -54,6 +56,9 @@ local function nest_label(frame)
 	if d < 1 then
 		return "MAIN"
 	end
+	if frame and frame.label and frame.label ~= "SUBTASK" then
+		return frame.label
+	end
 	return string.format("SUBTASK %d", d)
 end
 
@@ -62,8 +67,12 @@ end
 _G.TaiChatFoldText = function()
 	local line = vim.fn.getline(vim.v.foldstart)
 	local indent = (line:match("^(%s*)") or ""):gsub(" ", "\194\160")
-	local n = vim.v.foldend - vim.v.foldstart + 1
-	return indent .. "{{{ " .. tostring(n) .. " lines }}}"
+	local inner = line:match("%{%{%{%s*(.*)$") or ""
+	inner = inner:gsub("%s+$", "")
+	if inner == "" then
+		inner = tostring(vim.v.foldend - vim.v.foldstart + 1) .. " lines"
+	end
+	return indent .. "{{{ " .. inner .. " }}}"
 end
 
 local function apply_fold_settings(win)
@@ -113,22 +122,42 @@ local function refresh_and_close_folds()
 	end)
 end
 
-local function append_output(label, body, depth)
-	if label and label ~= "" then
-		M.append(label .. "\n", depth)
-	end
-	if body and body ~= "" then
-		M.append("{{{\n" .. body .. "\n}}}\n", depth)
-		refresh_and_close_folds()
-	end
-end
-
 -- Keep {{{ / }}} inside old/new text from closing the chat fold early.
 local function fold_safe(s)
 	if type(s) ~= "string" or s == "" then
 		return "(empty)"
 	end
 	return (s:gsub("}}}", "} } }"):gsub("{{{", "{ { {"))
+end
+
+local function mark_last_fold_failed()
+	if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
+		return
+	end
+	local lines = vim.api.nvim_buf_get_lines(M.buffer_nr, 0, -1, false)
+	for i = #lines, 1, -1 do
+		if lines[i]:find("{{{", 1, true) then
+			if not lines[i]:find("%[failed%]") then
+				local updated = lines[i]:gsub("%s*$", "") .. " [failed]"
+				vim.api.nvim_buf_set_lines(M.buffer_nr, i - 1, i, false, { updated })
+			end
+			return
+		end
+	end
+end
+
+local function append_output(label, body, depth, failed)
+	if failed and label and label ~= "" and not label:find("%[failed%]") then
+		label = label .. " [failed]"
+	end
+	local head = (label and label ~= "") and ("{{{ " .. label) or "{{{"
+	local text = head .. "\n"
+	if body and body ~= "" then
+		text = text .. fold_safe(body) .. "\n"
+	end
+	text = text .. "}}}\n"
+	M.append(text, depth)
+	refresh_and_close_folds()
 end
 
 local function format_edit_fold(old_text, new_text, result)
@@ -156,10 +185,16 @@ local function worker_history(frame)
 end
 
 local function prepare_messages(frame)
-	-- Isolated workers always start from scratch: system + goal only.
-	local msgs = frame.isolated and worker_history(frame) or vim.deepcopy(frame.history)
+	-- Isolated coordinators start from scratch: system + goal only.
+	-- Coders keep tool history so they can take more than one turn.
+	local msgs
+	if frame.isolated and not agent.iterates(frame) then
+		msgs = worker_history(frame)
+	else
+		msgs = vim.deepcopy(frame.history)
+	end
 	if msgs[1] and msgs[1].role == "system" then
-		local parts = { frame.system_prompt }
+		local parts = { agent.prompt_for(frame.role, frame.phase) }
 		local tool_section = agent.render_tools(frame.tools)
 		if tool_section ~= "" then
 			table.insert(parts, tool_section)
@@ -167,6 +202,27 @@ local function prepare_messages(frame)
 		local notes = tools_subtask.render_notes()
 		if notes ~= "" then
 			table.insert(parts, notes)
+		end
+		local task_notes = tools_plan.render_task_notes(frame.task_notes)
+		if task_notes ~= "" then
+			table.insert(parts, task_notes)
+		end
+		local plan_section = tools_plan.render_for(frame)
+		if plan_section ~= "" then
+			table.insert(parts, plan_section)
+		end
+		if frame.role == "orchestrator" then
+			if frame.phase == "decompose" then
+				table.insert(parts, "Here is the goal. Analyse it and answer if you should split it into smaller tasks.\n"
+					.. "Write a plan of children, or say this is a leaf.")
+			elseif frame.phase == "revise" then
+				table.insert(parts, "Last task: " .. tostring(frame.last_child_goal or "")
+					.. "\n\nOutput:\n" .. tostring(frame.last_child_report or "(no output)")
+					.. "\n\nHere is the plan. Analyse it and answer if you need to update later items."
+					.. " Copy useful discoveries from the output into notes.")
+			elseif frame.phase == "handoff" then
+				table.insert(parts, "Nothing is pending. Reply with the result of your goal. Include short discoveries from the reports.")
+			end
 		end
 		if frame.isolated then
 			local live = tools_subtask.render_memory(frame)
@@ -300,6 +356,14 @@ function M.init()
 	vim.bo[M.buffer_nr].swapfile = false
 	vim.bo[M.buffer_nr].modifiable = true
 	vim.bo[M.buffer_nr].filetype = "text"
+
+    -- Load session history
+    local chat_lines = context.load()
+    if chat_lines and #chat_lines > 0 then
+      vim.api.nvim_buf_set_lines(M.buffer_nr, -1, -1, false, chat_lines)
+    else
+      print("[DEBUG] No chat_lines to append or chat_lines is empty")
+    end
 
 	if not config.stream then
 		vim.keymap.set("i", "}", function()
@@ -441,7 +505,7 @@ local function run_live_shell(command, on_done, depth)
 	local finished = false
 	local stop_timer = nil
 
-	local function finish(out)
+	local function finish(out, code)
 		if finished then
 			return
 		end
@@ -455,7 +519,7 @@ local function run_live_shell(command, on_done, depth)
 			stop_timer = nil
 		end
 		vim.schedule(function()
-			on_done(out)
+			on_done(out, code or 0)
 		end)
 	end
 
@@ -485,7 +549,7 @@ local function run_live_shell(command, on_done, depth)
 			if (code or 0) ~= 0 then
 				full = full .. "\n[exit " .. tostring(code or 0) .. "]"
 			end
-			finish(full)
+			finish(full, code)
 		end,
 		stdout_buffered = false,
 		stderr_buffered = false,
@@ -500,7 +564,7 @@ local function run_live_shell(command, on_done, depth)
 
 	current_job = job
 	if job <= 0 then
-		finish("Failed to start: " .. command)
+		finish("Failed to start: " .. command, 1)
 		return
 	end
 
@@ -538,22 +602,21 @@ local function record_tool_output(frame, content)
 	table.insert(frame.tool_outputs, text)
 end
 
--- Worker is done: print reply at this indent, then pop and resume parent.
-local function finish_oneshot(frame, assistant_text, status)
-	if not frame or #stack <= 1 then
-		return false
-	end
-	if not status then
-		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
-			status = "error"
-		else
-			status = "ok"
-		end
-	end
-	local outcome = tools_subtask.outcome_for(frame, assistant_text)
-	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
-		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
-	end
+local function reset_worker(frame, goal)
+	frame.goal = goal
+	frame.tool_outputs = {}
+	frame.last_assistant = nil
+	frame.last_outcome = nil
+	frame._printed_content = nil
+	frame.continue_after_tools = false
+	frame.turns = 0
+	frame.last_tool_ok = nil
+	frame.history = worker_history(frame)
+end
+
+local print_plan
+
+local function return_to_parent(frame, status, outcome)
 	local close_depth = nest_depth(frame)
 	if close_depth > 0 then
 		close_depth = close_depth - 1
@@ -566,11 +629,24 @@ local function finish_oneshot(frame, assistant_text, status)
 	local parent = top()
 	if parent then
 		parent.steps = parent.steps or {}
+		local label = frame.goal or ""
+		if type(frame.goals) == "table" and #frame.goals > 1 then
+			label = table.concat(frame.goals, "; ")
+		end
 		table.insert(parent.steps, {
-			text = frame.goal or "",
+			text = label,
 			response = report,
 			status = status,
 		})
+		if frame.plan_step then
+			tools_plan.mark(parent, frame.plan_step, status, outcome)
+		end
+		if parent.role == "orchestrator" then
+			parent.phase = "revise"
+			parent.last_child_report = report
+			parent.last_child_goal = frame.goal
+			parent._needs_revise = true
+		end
 	end
 	M.update_chat_name()
 	update_input_name()
@@ -581,7 +657,6 @@ local function finish_oneshot(frame, assistant_text, status)
 		resume(report)
 		return true
 	end
-	-- Main keeps tool results in chat history. Isolated parents stay at goal-only.
 	if parent and frame.parent_call_id and not parent.isolated then
 		table.insert(parent.history, {
 			role = "tool",
@@ -591,6 +666,264 @@ local function finish_oneshot(frame, assistant_text, status)
 		})
 	end
 	return true
+end
+
+local function queue_report(frame)
+	local parts = {}
+	for i, r in ipairs(frame.goal_reports or {}) do
+		table.insert(parts, i .. ". " .. tostring(r.text or "") .. "\n" .. tostring(r.response or ""))
+	end
+	if #parts == 0 then
+		return frame.last_outcome or "(no output)"
+	end
+	return table.concat(parts, "\n\n")
+end
+
+local spawn_validator
+local after_goal_ok
+local finish_validator
+local after_orchestrator_turn
+local start_plan_child
+
+local function append_child_header(parent, child, step)
+	local depth = nest_depth(parent)
+	local child_depth = #stack
+	local head = child.label or "SUBTASK"
+	local goal = child.goal or ""
+	if step then
+		M.append(string.format("%s %s [%s]\n", head, goal, tostring(step)), depth)
+	else
+		M.append(head .. " " .. goal .. "\n", depth)
+	end
+	if child.tools and #child.tools > 0 then
+		M.append("tools: " .. table.concat(child.tools, ", ") .. "\n", child_depth)
+	end
+end
+
+print_plan = function(frame, why)
+	if not frame then
+		return
+	end
+	local body = tools_plan.render_for(frame)
+	if body == "" then
+		return
+	end
+	local title = "PLAN"
+	if why and why ~= "" then
+		title = "PLAN " .. why
+	end
+	M.append(title .. "\n" .. body .. "\n", nest_depth(frame))
+end
+
+start_plan_child = function(parent, step, item, resume)
+	item = item or (step and tools_plan.item(parent, step))
+	if not item then
+		return false
+	end
+	local role = agent.parse_role(item.agent, { profile = "subtask", tools = item.tools })
+	local child = agent.new_frame({
+		profile = "subtask",
+		role = role,
+		tools = role == "orchestrator" and nil or item.tools,
+		goal = item.goal,
+		depth = #stack,
+		task_notes = item.notes or "",
+		plan_step = step,
+		plan_root = parent.plan_root or parent.plan,
+		plan_path = step and tools_plan.child_path(parent, step) or (parent.plan_path or {}),
+		phase = role == "orchestrator" and "decompose" or nil,
+	})
+	if step then
+		tools_plan.mark(parent, step, "running")
+	end
+	append_child_header(parent, child, step)
+	child.on_parent_resume = resume or function(report)
+		parent.phase = "revise"
+		parent.last_child_report = report
+		parent.last_child_goal = child.goal
+		M.continue()
+	end
+	table.insert(stack, child)
+	M.update_chat_name()
+	update_input_name()
+	maybe_auto_save()
+	M.continue()
+	return true
+end
+
+after_orchestrator_turn = function(frame, text)
+	local step, item = tools_plan.next_pending(frame)
+	if step then
+		frame.phase = "run"
+		return start_plan_child(frame, step, item)
+	end
+	if frame.phase == "decompose" then
+		frame.phase = "run"
+		local leaf = {
+			agent = "coder",
+			goal = frame.goal or tools_subtask.frame_goal(frame),
+			notes = frame.task_notes or "",
+			tools = vim.deepcopy(agent.coder_tools),
+			status = "pending",
+		}
+		return start_plan_child(frame, nil, leaf)
+	end
+	if is_worker() then
+		if text and not agent.weak_phase_reply(text) then
+			frame.phase = "handoff"
+			frame.last_outcome = text
+			return spawn_validator(frame, text)
+		end
+		frame.phase = "handoff"
+		M.continue()
+		return true
+	end
+	frame.phase = nil
+	current_state = "idle"
+	update_input_name()
+	maybe_auto_save()
+	return false
+end
+
+after_goal_ok = function(frame)
+	frame.goal_reports = frame.goal_reports or {}
+	table.insert(frame.goal_reports, {
+		text = frame.goal,
+		response = frame.last_outcome or "",
+	})
+	frame.steps = frame.steps or {}
+	table.insert(frame.steps, {
+		text = frame.goal,
+		response = frame.last_outcome or "",
+		status = "ok",
+	})
+	local idx = frame.goal_index or 1
+	local goals = frame.goals or { frame.goal }
+	if idx < #goals then
+		frame.goal_index = idx + 1
+		frame.validate_retries = 0
+		local next_goal = goals[frame.goal_index]
+		local parent_depth = math.max(0, nest_depth(frame) - 1)
+		local n = #goals
+		M.append(string.format("%s %s (%d/%d)\n", frame.label or "CODER", next_goal, idx + 1, n), parent_depth)
+		if frame.tools and #frame.tools > 0 then
+			M.append("tools: " .. table.concat(frame.tools, ", ") .. "\n", nest_depth(frame))
+		end
+		reset_worker(frame, next_goal)
+		M.update_chat_name()
+		maybe_auto_save()
+		M.continue()
+		return true
+	end
+	return return_to_parent(frame, "ok", queue_report(frame))
+end
+
+spawn_validator = function(subject, outcome)
+	if #stack >= (agent.MAX_DEPTH or 8) then
+		return after_goal_ok(subject)
+	end
+	tools_changes.collect_shell(subject, config.root)
+	local child = agent.new_frame({
+		profile = "subtask",
+		role = "validator",
+		goal = tools_subtask.validator_brief(
+			subject.goal,
+			outcome,
+			tools_changes.render(subject),
+			tools_changes.render_commands(subject)
+		),
+		tools = {},
+		depth = #stack,
+		task_notes = subject.task_notes,
+	})
+	M.append("VALIDATOR\n", nest_depth(subject))
+	table.insert(stack, child)
+	M.update_chat_name()
+	update_input_name()
+	maybe_auto_save()
+	M.continue()
+	return true
+end
+
+finish_validator = function(vframe, assistant_text)
+	local text = assistant_text or ""
+	if not vframe._printed_content and type(text) == "string" and text ~= "" then
+		M.append("\n" .. text .. "\n", nest_depth(vframe))
+	end
+	if top() == vframe then
+		table.remove(stack)
+	end
+	local subject = top()
+	if not subject or subject.role == "validator" or #stack <= 1 then
+		return false
+	end
+	local verdict, detail = tools_subtask.parse_verdict(text)
+	if verdict == "ok" then
+		return after_goal_ok(subject)
+	end
+	if verdict == "blocked" then
+		local why = detail or "blocked"
+		M.append("BLOCKED " .. why .. "\n", nest_depth(subject))
+		local outcome = subject.last_outcome or ""
+		if outcome ~= "" then
+			outcome = "blocked: " .. why .. "\n\n" .. outcome
+		else
+			outcome = "blocked: " .. why
+		end
+		return return_to_parent(subject, "blocked", outcome)
+	end
+	subject.validate_retries = (subject.validate_retries or 0) + 1
+	if subject.validate_retries > (agent.MAX_VALIDATE_RETRIES or 2) then
+		M.append("validator retries exhausted\n", nest_depth(subject))
+		return after_goal_ok(subject)
+	end
+	local goal = subject.original_goal or subject.goal
+	if detail and tools_subtask.same_scope(goal, detail) then
+		tools_subtask.apply_missing(subject, detail)
+		M.append("RETRY " .. detail .. "\n", nest_depth(subject))
+	else
+		M.append("RETRY (stay on the Goal)\n", nest_depth(subject))
+	end
+	reset_worker(subject, goal)
+	M.update_chat_name()
+	maybe_auto_save()
+	M.continue()
+	return true
+end
+
+-- Worker is done: validate (unless this is the validator), then pop or retry.
+local function finish_oneshot(frame, assistant_text, status)
+	if not frame or #stack <= 1 then
+		return false
+	end
+	if not status then
+		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
+			status = "error"
+		else
+			status = "ok"
+		end
+	end
+	if frame.role == "validator" then
+		return finish_validator(frame, assistant_text)
+	end
+	if frame.last_tool_ok == false and tools_subtask.is_weak_reply(assistant_text or "") then
+		M.append("tool failed; continuing\n", nest_depth(frame))
+		M.continue()
+		return true
+	end
+	if frame.role == "orchestrator"
+		and (frame.phase == "decompose" or frame.phase == "revise") then
+		return after_orchestrator_turn(frame, assistant_text)
+	end
+	local outcome = tools_subtask.outcome_for(frame, assistant_text)
+	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
+		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
+	end
+	if status == "error" then
+		return return_to_parent(frame, "error", outcome)
+	end
+	frame.last_outcome = outcome
+	return spawn_validator(frame, outcome)
 end
 
 local function after_tool_round(frame, stop)
@@ -604,12 +937,29 @@ local function after_tool_round(frame, stop)
 	if stop then
 		return
 	end
-	-- Nested subtask sets continue_after_tools. Work tools end this worker.
-	if is_worker() and not frame.continue_after_tools then
+	if frame._needs_revise then
+		frame._needs_revise = false
+		frame.phase = "revise"
+		M.continue()
+		return
+	end
+	if frame.role == "orchestrator"
+		and (frame.phase == "decompose" or frame.phase == "revise") then
+		after_orchestrator_turn(frame, frame.last_assistant)
+		return
+	end
+	-- A failed tool never ends a coder. They must see the error and retry.
+	if agent.iterates(frame) and frame.last_tool_ok == false then
+		M.continue()
+		return
+	end
+	-- Coordinators end on work tools. Coders keep going until they reply
+	-- with no tool call. Nested subtask / notes / plan set continue_after_tools.
+	if is_worker() and not frame.continue_after_tools and not agent.iterates(frame) then
 		finish_oneshot(frame, frame.last_assistant)
 		return
 	end
-	if frame.isolated then
+	if frame.isolated and not agent.iterates(frame) then
 		frame.history = worker_history(frame)
 	end
 	M.continue()
@@ -642,20 +992,6 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 	local history = frame.history
 	local depth = nest_depth(frame)
 	frame.continue_after_tools = false
-
-	if type(tool_calls) == "table" and #tool_calls > 1 then
-		for i = 2, #tool_calls do
-			local extra = tool_calls[i]
-			local fn = extra["function"] or {}
-			table.insert(history, {
-				role = "tool",
-				name = fn.name,
-				tool_call_id = extra.id,
-				content = "Only one tool call per turn. Ignored.",
-			})
-		end
-		tool_calls = { tool_calls[1] }
-	end
 
 	if start_index == 1 then
 		M.append("\n", depth)
@@ -694,14 +1030,24 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			process_from(i + 1)
 		end
 
+		local function note_call(summary, failed)
+			if type(summary) == "string" and summary ~= "" then
+				tools_changes.record_command(frame, summary, failed)
+			end
+		end
+
+		frame.last_tool_ok = true
+
 		if not agent.tool_granted(frame.tools, name) then
 			local granted = table.concat(frame.tools or {}, ", ")
 			if granted == "" then
 				granted = "(none)"
 			end
-			M.append("tool denied: " .. tostring(name) .. "\n", depth)
 			res.content = "Tool `" .. tostring(name) .. "` is not granted. Granted: "
 				.. granted .. ". Call subtask and pass the tool if a child needs it."
+			append_output("tool denied: " .. tostring(name), res.content, depth, true)
+			note_call(tostring(name), true)
+			frame.last_tool_ok = false
 			finish_one()
 			return
 		end
@@ -709,16 +1055,24 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 		if name == "shell" then
 			local command = args.command
 			if type(command) ~= "string" or command == "" then
-				M.append("shell: missing command\n", depth)
 				res.content = "missing command field"
+				append_output("shell: missing command", res.content, depth, true)
+				note_call("shell: missing command", true)
+				frame.last_tool_ok = false
 			else
 				local unsafe = tools_shell.unsafe_command(command)
 				if not unsafe or config.auto_approve then
-					M.append("shell: " .. command .. "\n{{{\n", depth)
+					M.append("{{{ shell: " .. command .. "\n", depth)
 					current_state = "tools"
 					update_input_name()
-					run_live_shell(command, function(out)
+					run_live_shell(command, function(out, code)
 						res.content = tools_io.limit_output(out, "shell")
+						local failed = (code or 0) ~= 0
+						tools_changes.record_command(frame, command, failed)
+						if failed then
+							frame.last_tool_ok = false
+							mark_last_fold_failed()
+						end
 						M.append((out or "") .. "\n}}}\n", depth)
 						refresh_and_close_folds()
 						finish_one()
@@ -737,41 +1091,73 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			end
 		elseif name == "read" then
 			if not args.file then
-				M.append("read: missing file\n", depth)
 				res.content = "missing file field"
+				append_output("read: missing file", res.content, depth, true)
+				note_call("read: missing file", true)
+				frame.last_tool_ok = false
 			elseif vim.fn.filereadable(args.file) ~= 1 then
-				M.append("read: " .. args.file .. " not readable\n", depth)
 				res.content = "file does not exist or is not readable"
+				append_output("read: " .. args.file, res.content, depth, true)
+				note_call("read: " .. args.file, true)
+				frame.last_tool_ok = false
 			else
 				local range_label = args.range and (" [" .. args.range .. "]") or ""
 				res.content = tools_io.read_file(args.file, args.range)
 				res.file_range = args.range
-				append_output("read: " .. args.file .. range_label, res.content, depth)
+				local failed = type(res.content) == "string"
+					and (res.content:match("^Error") or res.content:match("^Paths cannot")
+						or res.content:match("^File `") or res.content:match("^Binary"))
+				if failed then
+					frame.last_tool_ok = false
+				end
+				note_call("read: " .. args.file .. range_label, failed)
+				append_output("read: " .. args.file .. range_label, res.content, depth, failed)
 			end
 		elseif name == "edit" then
 			if not args.file then
-				M.append("edit: missing file\n", depth)
 				res.content = "missing file field"
+				append_output("edit: missing file", res.content, depth, true)
+				note_call("edit: missing file", true)
+				frame.last_tool_ok = false
 			else
 				local out = tools_edit.edit(args.file, args.old_text, args.new_text, args.multi, config)
 				res.content = out
+				local failed = type(out) == "string" and not out:match("^Patched")
+				if failed then
+					frame.last_tool_ok = false
+				else
+					tools_changes.record_edit(frame, args.file, args.old_text, args.new_text)
+				end
+				note_call("edit: " .. args.file, failed)
 				append_output(
 					"edit: " .. args.file,
 					format_edit_fold(args.old_text, args.new_text, out),
-					depth
+					depth,
+					failed
 				)
 			end
 		elseif name == "write" then
 			if not args.file then
-				M.append("write: missing file\n", depth)
 				res.content = "missing file field"
+				append_output("write: missing file", res.content, depth, true)
+				note_call("write: missing file", true)
+				frame.last_tool_ok = false
 			elseif not args.content then
-				M.append("write: missing content\n", depth)
 				res.content = "missing content field"
+				append_output("write: " .. args.file, res.content, depth, true)
+				note_call("write: " .. args.file, true)
+				frame.last_tool_ok = false
 			else
 				local out = tools_subtask.write(args.file, args.content)
 				res.content = out
-				append_output("write: " .. args.file, out, depth)
+				local failed = type(out) == "string" and not out:match("^File created")
+				if failed then
+					frame.last_tool_ok = false
+				else
+					tools_changes.record_write(frame, args.file, args.content)
+				end
+				note_call("write: " .. args.file, failed)
+				append_output("write: " .. args.file, out, depth, failed)
 			end
 		elseif name == "subtask" then
 			local first_sub
@@ -782,42 +1168,70 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 					break
 				end
 			end
-			local goal = args.goal or args.Goal or args.task
-			if type(goal) == "number" then
-				goal = tostring(goal)
+			local step = tonumber(args.step)
+			local plan_item
+			if step then
+				plan_item = tools_plan.item(frame, step)
 			end
-			if type(goal) == "string" then
-				goal = goal:match("^%s*(.-)%s*$") or goal
-			else
-				goal = nil
+			local goals = agent.parse_goals(args.goal or args.Goal or args.task, args.goals)
+			if plan_item and #goals == 0 then
+				goals = { plan_item.goal }
 			end
+			local goal = goals[1]
 			local parent_goal = tools_subtask.frame_goal(frame)
+			local role_src = args.role or (plan_item and plan_item.agent)
+			local role = agent.parse_role(role_src, { profile = "subtask", tools = args.tools })
 			if first_sub and i ~= first_sub then
-				M.append("subtask skipped: only one per turn\n", depth)
 				res.content = "Only one subtask per turn. Wait for this step, then continue."
+				append_output("subtask skipped", res.content, depth, true)
+				note_call("subtask skipped", true)
+			elseif step and not plan_item then
+				res.content = "plan item " .. tostring(step) .. " not found. Write a plan first."
+				append_output("subtask failed: no plan item " .. tostring(step), res.content, depth, true)
+				note_call("subtask: no plan item " .. tostring(step), true)
 			elseif not goal or goal == "" then
-				M.append("subtask failed: no goal\n", depth)
 				res.content = "missing goal"
+				append_output("subtask failed: no goal", res.content, depth, true)
+				note_call("subtask: no goal", true)
 			elseif parent_goal ~= "" and tools_subtask.same_goal(parent_goal, goal) then
-				M.append("subtask failed: goal copies the current Goal\n", depth)
 				res.content = "goal must be a more specific next step, not a copy of the current Goal: "
 					.. goal
+				append_output("subtask failed: goal copies the current Goal", res.content, depth, true)
+				note_call("subtask: " .. goal, true)
 			elseif #stack >= (agent.MAX_DEPTH or 8) then
-				M.append("subtask failed: max depth\n", depth)
 				res.content = "max subtask depth reached"
+				append_output("subtask failed: max depth", res.content, depth, true)
+				note_call("subtask: max depth", true)
 			else
-				local child_tools = agent.sanitize_subtask_tools(args.tools)
 				local child_depth = #stack
-				M.append("SUBTASK " .. goal .. "\n", depth)
-				M.append("tools: " .. table.concat(child_tools, ", ") .. "\n", child_depth)
 				local child = agent.new_frame({
 					profile = "subtask",
+					role = role,
 					system_prompt = args.system_prompt,
-					tools = child_tools,
+					tools = role == "orchestrator" and nil or args.tools,
 					goal = goal,
+					goals = goals,
 					depth = child_depth,
 					parent_call_id = call.id,
+					task_notes = plan_item and plan_item.notes or "",
+					plan_step = step,
+					plan_root = frame.plan_root or frame.plan,
+					plan_path = step and tools_plan.child_path(frame, step) or (frame.plan_path or {}),
 				})
+				if plan_item then
+					tools_plan.mark(frame, step, "running")
+				end
+				local n = #(child.goals or {})
+				local head = child.label or "SUBTASK"
+				if n > 1 then
+					M.append(string.format("%s %s (1/%d)\n", head, goal, n), depth)
+				else
+					M.append(head .. " " .. goal .. "\n", depth)
+				end
+				if child.tools and #child.tools > 0 then
+					M.append("tools: " .. table.concat(child.tools, ", ") .. "\n", child_depth)
+				end
+				note_call("subtask: " .. goal, false)
 				child.on_parent_resume = function(report)
 					frame.continue_after_tools = true
 					res.content = report
@@ -836,23 +1250,39 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			-- Notes is briefing, not work. Keep the worker so it can subtask next.
 			frame.continue_after_tools = true
 			local body = tools_subtask.get_notes()
+			local notes_fail = type(out) == "string" and out:match("^Error")
 			if body ~= "" then
-				append_output("notes: " .. (args.action or "?"), body, depth)
+				append_output("notes: " .. (args.action or "?"), body, depth, notes_fail)
 			else
-				M.append("notes: " .. out .. "\n", depth)
+				append_output("notes: " .. (args.action or "?"), out, depth, notes_fail)
+			end
+			note_call("notes: " .. (args.action or "?"), notes_fail)
+		elseif name == "plan" then
+			local out = tools_plan.run(args, frame)
+			res.content = out
+			frame.continue_after_tools = true
+			note_call("plan: " .. (args.action or "?"), type(out) == "string" and out:match("^Error"))
+			if args.action == "write" or args.action == "update" then
+				print_plan(frame, args.action)
 			end
 		elseif name == "skill" then
 			local out = tools_skill.run(args)
 			res.content = out
 			append_output("skill: " .. (args.action or "?"), out, depth)
+			note_call("skill: " .. (args.action or "?"), false)
 		elseif name == "mcp" then
 			local async_actions = { connect = true, call = true }
 			if async_actions[args.action] then
-				M.append("mcp: " .. (args.action or "?") .. "\n{{{\n", depth)
+				M.append("{{{ mcp: " .. (args.action or "?") .. "\n", depth)
 				current_state = "tools"
 				update_input_name()
 				tools_mcp.run(args, function(out)
 					res.content = tools_io.limit_output(out or "", "mcp")
+					if type(out) == "string" and out:match("^Error") then
+						frame.last_tool_ok = false
+						mark_last_fold_failed()
+					end
+					note_call("mcp: " .. (args.action or "?"), type(out) == "string" and out:match("^Error"))
 					M.append((out or "") .. "\n}}}\n", depth)
 					refresh_and_close_folds()
 					finish_one()
@@ -861,18 +1291,25 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			end
 			local out = tools_mcp.run(args)
 			res.content = out
-			append_output("mcp: " .. (args.action or "?"), out or "", depth)
+			local mcp_fail = type(out) == "string" and out:match("^Error")
+			append_output("mcp: " .. (args.action or "?"), out or "", depth, mcp_fail)
+			note_call("mcp: " .. (args.action or "?"), mcp_fail)
 		elseif name == "send_image" then
 			if not args.file then
-				M.append("image: missing file\n", depth)
 				res.content = "Missing file field"
+				append_output("image: missing file", res.content, depth, true)
+				note_call("image: missing file", true)
+				frame.last_tool_ok = false
 			else
 				local image_url, err = tools_subtask.image_data_url(args.file)
 				if not image_url then
-					M.append("image: " .. args.file .. " failed: " .. err .. "\n", depth)
 					res.content = "Error: " .. err
+					append_output("image: " .. args.file, res.content, depth, true)
+					note_call("image: " .. args.file, true)
+					frame.last_tool_ok = false
 				else
-					M.append("image: " .. args.file .. "\n", depth)
+					append_output("image: " .. args.file, args.prompt or "sent", depth)
+					note_call("image: " .. args.file, false)
 					local content = {}
 					if args.prompt then
 						table.insert(content, { type = "text", text = args.prompt })
@@ -886,7 +1323,9 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 			end
 		else
 			res.content = "Invalid tool name: " .. (name or "")
-			M.append("invalid tool: " .. (name or "") .. "\n", depth)
+			append_output("invalid tool: " .. (name or ""), res.content, depth, true)
+			note_call("invalid tool: " .. (name or ""), true)
+			frame.last_tool_ok = false
 		end
 
 		finish_one()
@@ -926,9 +1365,15 @@ function M.send_input()
 			local command = args.command
 			if response == "y" or response == "yes" then
 				M.append("Confirmed...\n", depth)
-				M.append("shell: " .. tostring(command) .. "\n{{{\n", depth)
-				run_live_shell(command, function(out)
+				M.append("{{{ shell: " .. tostring(command) .. "\n", depth)
+				run_live_shell(command, function(out, code)
 					res.content = tools_io.limit_output(out, "shell")
+					local failed = (code or 0) ~= 0
+					tools_changes.record_command(frame, command, failed)
+					if failed then
+						frame.last_tool_ok = false
+						mark_last_fold_failed()
+					end
 					M.append((out or "") .. "\n}}}\n", depth)
 					refresh_and_close_folds()
 					record_tool_output(frame, res.content)
@@ -940,8 +1385,7 @@ function M.send_input()
 				end, depth)
 				return
 			elseif response == "s" or response == "stop" then
-				M.append("Stopped\n", depth)
-				M.append("shell stopped: " .. tostring(command) .. "\n", depth)
+				append_output("shell: " .. tostring(command), "User stopped execution.", depth, true)
 				hard_stop = true
 				res.content = "User stopped execution."
 				record_tool_output(frame, res.content)
@@ -953,8 +1397,8 @@ function M.send_input()
 				maybe_auto_save()
 				return
 			else
-				M.append("shell declined: " .. tostring(command) .. "\n", depth)
 				res.content = "User declined running this command: " .. input
+				append_output("shell: " .. tostring(command), res.content, depth, true)
 				record_tool_output(frame, res.content)
 				table.insert(history, res)
 				table.remove(pending_tools, 1)
@@ -967,6 +1411,7 @@ function M.send_input()
 			if not is_worker() then
 				frame.goal = input
 				frame.steps = {}
+				frame.phase = "decompose"
 			end
 			table.insert(history, { role = "user", content = input })
 			add_sep("___ USER ")
@@ -1054,6 +1499,12 @@ end
 
 function M.continue()
 	local frame = top()
+	frame.turns = (frame.turns or 0) + 1
+	if agent.iterates(frame) and frame.turns > (agent.MAX_CODER_TURNS or 12) then
+		M.append("coder turn limit\n", nest_depth(frame))
+		finish_oneshot(frame, frame.last_assistant or "(turn limit)", "ok")
+		return
+	end
 	local hist = frame.history
 	local cfg = frame_config(frame)
 	local msgs = prepare_messages(frame)
@@ -1064,6 +1515,15 @@ function M.continue()
 	update_input_name()
 
 	local function on_idle_no_tools(content)
+		if frame.role == "orchestrator"
+			and (frame.phase == "decompose" or frame.phase == "revise") then
+			after_orchestrator_turn(frame, content)
+			return
+		end
+		if frame.last_tool_ok == false and tools_subtask.is_weak_reply(content or "") then
+			M.continue()
+			return
+		end
 		if is_worker() then
 			finish_oneshot(frame, content or "(no output)")
 			return

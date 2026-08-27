@@ -32,58 +32,70 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  MAIN (multi-turn, subtask + notes)                          │
-│  Live Context: shared notes                                  │
-│                                                              │
-│   reply if done, else subtask(one concrete next step)        │
+│  MAIN orchestrator (fixed: subtask + notes + plan)           │
+│  harness: break this goal into smaller tasks?                │
+│  then run pending; after return: update the plan?            │
 │        │                                                     │
 │        ▼                                                     │
-│   ┌──────────────────────────────────────────────────────┐   │
-│   │  SUBTASK (clean history)  fold                       │   │
-│   │  Goal + Previous steps at this level                 │   │
-│   │  work, or subtask, then next step or reply           │   │
-│   └──────────────────────┬───────────────────────────────┘   │
-│                          │ step recorded as previous step    │
-│                          ▼                                   │
-│   next subtask, or answer the user                           │
+│   CODER / branch orch  (goal + TASK NOTES)                   │
+│        │ text reply (no tool)                                │
+│        ▼                                                     │
+│   VALIDATOR (goal + result + task notes)                     │
+│        │ ok / blocked → return                               │
+│        │ missing → coder retries that action                 │
+│        ▼                                                     │
+│   orchestrator plan.update later items, then step=N+1        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **Rules of the harness:**
 
-1. No `todos` tool. Agents **answer** or call **`subtask`** (one step).
-2. Answer only if it fully addresses the goal. A subtask is one step
-   toward that goal.
-3. When a child returns, its report is injected into the parent’s system
-   prompt and the parent is asked again. The child’s final text is the result.
-4. Max depth is 8. A child may nest only if granted `subtask`. Pass a
-   `read`/`shell`/`edit` for a leaf; omit `tools` for a coordinator.
-   Ungranted tools are denied.
-5. Main is the orchestrator (`subtask` + shared `notes`). Work happens in subagents.
+1. Roles: **orchestrator** (plan and dispatch), **coder** (do one goal over
+   as many tool turns as needed), **validator** (`ok`, `missing:`, or
+   `blocked:`). Each has its own system prompt.
+2. Orchestrator tools are fixed (`subtask`, `notes`, `plan`). The plan is a
+   **tree**. A branch orchestrator edits only its children; the top one can
+   change any node (`1.2`). Each item has `agent`, `status`, `goal`, `notes`.
+   Dispatch with `subtask.step`. The child gets that item's goal and notes.
+   When the branch is done, the orchestrator replies in text (same handoff
+   as a coder).
+3. Before a worker returns, the harness calls the validator. `missing`
+   retries the coder (max 2) with that next action. `blocked` returns
+   the step as a failure so the orchestrator can change later items.
+   `ok` marks the plan item done.
+4. After a return, the caller is asked again so it can `plan.update`
+   later items, then send the next step. Answer only when the request is done.
+5. Max depth is 8. Ungranted tools are denied. Validator has no tools.
 
 ### Subtask tool parameters
 
 | Field | Required | Description |
 |---|---|---|
-| `goal` | yes | The next step (paths, action). Must not copy the current Goal |
-| `tools` | no | Child tools. Default is `subtask` + `notes`. Pass `read`/`shell`/`edit` for a leaf. |
-| `system_prompt` | no | Override the default worker prompt |
+| `step` | no | 1-based index into the caller's plan. Child gets that item's goal, agent, and notes |
+| `goal` | yes* | One action if you are not using `step` / `goals` |
+| `goals` | no | Granular goals. The harness runs and validates each in order |
+| `role` | no | `orchestrator`, `coder`, or `validator`. Inferred from the plan item or tools |
+| `tools` | no | Child tools. Coder default is `read`/`shell`/`notes`. Orchestrator default is `subtask`/`notes`/`plan` |
+| `system_prompt` | no | Override the role prompt |
 
 Examples:
 
 ```json
 {
-  "goal": "List lua/tai and report which file defines main_tools.",
-  "tools": ["read", "shell"]
+  "action": "write",
+  "items": [
+    { "agent": "coder", "goal": "List lua/tai and name session-load files.", "notes": "Project root is the cwd." },
+    { "agent": "coder", "goal": "Read the load function.", "notes": "Fill this after step 1." }
+  ]
 }
 ```
 
 ```json
-{
-  "goal": "In lua/tai/agent.lua, change main_tools to only subtask. Minimal diff.",
-  "tools": ["read", "edit"],
-  "system_prompt": "You are a careful implementer. Do not freestyle architecture."
-}
+{ "step": 1, "tools": ["read", "shell"] }
+```
+
+```json
+{ "action": "update", "index": 2, "goal": "Read lua/tai/context.lua 1:80", "notes": "load() is in context.lua" }
 ```
 
 ## Providers
@@ -261,12 +273,13 @@ Example `.tai` file:
 | `send_image` | Send images for visual analysis |
 | `edit` | Search-and-replace edit (`multi` flag supported) |
 | `write` | Create new files |
-| `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
+| `subtask` | Child agent (`step` into the plan, or `goal` / `goals`, optional `role` / `tools`) |
+| `plan` | Structured plan: write / update / status (`agent`, `status`, `goal`, `notes`) |
 | `notes` | Write/append the shared notepad (injected every turn for main and workers) |
 | `mcp` | MCP status / connect / disconnect / list_tools / call |
 
-Main and default children get `subtask` + `notes`. Pass `read`/`shell`/`edit`
-in `tools` for a one-shot leaf.
+Main is an orchestrator (`subtask` + `notes` + `plan`). Coders default to
+`read` / `shell` / `notes`. A validator checks each return before the parent continues.
 
 ### `mcp` tool
 

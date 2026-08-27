@@ -57,11 +57,19 @@ local function is_weak_reply(s)
 	if s == "" then
 		return true
 	end
+	local lower = s:lower():gsub("%s+$", "")
+	if lower == "handoff" or lower == "handoff." then
+		return true
+	end
 	if s:match("^I'll ") or s:match("^I will ") or s:match("^Let me ")
 		or s:match("^Looking ") or s:match("^I am going") then
 		return true
 	end
 	return false
+end
+
+function M.is_weak_reply(s)
+	return is_weak_reply(trim_text(s))
 end
 
 function M.outcome_for(frame, assistant_text)
@@ -106,7 +114,8 @@ function M.format_progress(frame)
 	end
 	for i = start, #steps do
 		local step = steps[i]
-		table.insert(lines, string.format("%d. %s", i, step.text or ""))
+		local tag = step.status == "blocked" and " [blocked]" or ""
+		table.insert(lines, string.format("%d. %s%s", i, step.text or "", tag))
 		local resp = step.response
 		if type(resp) == "string" and resp ~= "" then
 			resp = M.cap_report(resp, 600)
@@ -115,7 +124,141 @@ function M.format_progress(frame)
 			end
 		end
 	end
+	if frame.role == "orchestrator" then
+		table.insert(lines, "")
+		local last = steps[#steps]
+		if last and last.status == "blocked" then
+			table.insert(lines, "Last step was blocked. Update later plan items. Do not repeat that step.")
+		else
+			table.insert(lines, "Last step was validated. Copy useful discoveries into notes. Update later plan items (goal, notes, agent) if needed, then dispatch the next step or answer.")
+		end
+	end
 	return table.concat(lines, "\n")
+end
+
+function M.validator_brief(goal, outcome, changes_text, commands_text)
+	local parts = {
+		"Goal:",
+		tostring(goal or ""),
+		"",
+		"Result:",
+		tostring(outcome or "(no output)"),
+	}
+	if type(commands_text) == "string" and commands_text ~= "" then
+		table.insert(parts, "")
+		table.insert(parts, "Tools (this agent only, no output):")
+		table.insert(parts, commands_text)
+	end
+	if type(changes_text) == "string" and changes_text ~= "" then
+		table.insert(parts, "")
+		table.insert(parts, "Changes (this agent only):")
+		table.insert(parts, changes_text)
+	end
+	table.insert(parts, "")
+	table.insert(parts, "Did the Result complete this Goal? Reply exactly:")
+	table.insert(parts, "ok")
+	table.insert(parts, "missing: <undone part of the Goal, in the Goal's words>")
+	table.insert(parts, "blocked: <a premise in the Goal is false>")
+	table.insert(parts, "Do not invent a new task, command, or file.")
+	return table.concat(parts, "\n")
+end
+
+local function labeled_line(text, label)
+	local pos = text:lower():find(label .. ":", 1, true)
+	if not pos then
+		return nil
+	end
+	local rest = text:sub(pos + #label + 1)
+	rest = rest:match("^[^\n]+") or rest
+	rest = rest:match("^%s*(.-)%s*$") or rest
+	if rest == "" then
+		return nil
+	end
+	return rest
+end
+
+function M.parse_verdict(text)
+	text = trim_text(text)
+	if text == "" then
+		return "missing", "empty validator reply"
+	end
+	local first = text:match("^[^\n]+") or text
+	first = first:match("^%s*(.-)%s*$") or first
+	local lower = first:lower()
+	if lower == "ok" or lower == "ok." or lower:match("^status:%s*ok") then
+		return "ok"
+	end
+	local blocked = labeled_line(text, "blocked")
+	if blocked then
+		return "blocked", blocked
+	end
+	if lower == "blocked" or lower:match("^blocked%s") then
+		return "blocked", first
+	end
+	local missing = labeled_line(text, "missing")
+	if missing then
+		return "missing", missing
+	end
+	return "missing", first
+end
+
+local STOP = {
+	that = true, this = true, with = true, from = true, into = true,
+	have = true, been = true, will = true, they = true, them = true,
+	["then"] = true, than = true, when = true, what = true, your = true,
+	their = true, about = true, which = true, where = true, there = true,
+}
+
+local function content_words(s)
+	local out = {}
+	for w in tostring(s or ""):lower():gmatch("[%w_./-]+") do
+		if #w >= 4 and not STOP[w] then
+			out[w] = true
+		end
+	end
+	return out
+end
+
+--- True when `text` still talks about the Goal, not a new job.
+function M.same_scope(goal, text)
+	if type(text) ~= "string" or text == "" then
+		return false
+	end
+	local g = content_words(goal)
+	local t = content_words(text)
+	local tn, hit = 0, 0
+	for w in pairs(t) do
+		tn = tn + 1
+		if g[w] then
+			hit = hit + 1
+		end
+	end
+	if tn == 0 then
+		return false
+	end
+	-- missing must mostly reuse the Goal's words, not add a new job.
+	return hit >= math.max(1, math.ceil(tn * 0.5))
+end
+
+function M.apply_missing(frame, detail)
+	if not frame then
+		return
+	end
+	local goal = frame.original_goal or frame.goal
+	frame.original_goal = goal
+	frame.goal = goal
+	if type(detail) ~= "string" or detail == "" then
+		return
+	end
+	if not M.same_scope(goal, detail) then
+		return
+	end
+	local extra = "Still undone from the Goal (do this part only, do not change the Goal): " .. detail
+	if frame.task_notes and frame.task_notes ~= "" then
+		frame.task_notes = frame.task_notes .. "\n" .. extra
+	else
+		frame.task_notes = extra
+	end
 end
 
 -- Shared notepad for the whole stack (main + every worker).
@@ -197,6 +340,13 @@ end
 function M.format_complete(status, summary, frame)
 	local outcome = summary or M.outcome_for(frame, nil)
 	local step = frame and frame.goal or "?"
+	if status == "blocked" then
+		return table.concat({
+			"status: blocked",
+			"step: " .. step,
+			"blocked: " .. outcome,
+		}, "\n")
+	end
 	if status == "error" or is_error_text(outcome) then
 		return table.concat({
 			"status: error",

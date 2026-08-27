@@ -5,6 +5,7 @@ local tools_io = require("tai.tools.io")
 local tools_shell = require("tai.tools.shell")
 local tools_edit = require("tai.tools.edit")
 local tools_subtask = require("tai.tools.subtask")
+local tools_plan = require("tai.tools.plan")
 local tools_skill = require("tai.tools.skill")
 local tools_mcp = require("tai.tools.mcp")
 
@@ -25,6 +26,8 @@ M.render_notes = tools_subtask.render_notes
 M.render_memory = tools_subtask.render_memory
 M.format_complete = tools_subtask.format_complete
 M.run_notes = tools_subtask.run_notes
+M.run_plan = tools_plan.run
+M.render_plan = tools_plan.render
 M.run_skill = tools_skill.run
 M.run_mcp = tools_mcp.run
 
@@ -80,21 +83,34 @@ M.defs = {
 		["function"] = {
 			name = "subtask",
 			description =
-			"Spawn an agent for one smaller next step, not the whole Goal. "
-				.. "The child starts empty: it sees only this goal, NOTES, and its own previous steps. "
-				.. "`goal` must be a self-contained brief (paths, names, what fact to return). "
-				.. "One tool call per turn.",
+			"Spawn an agent for granular next steps. "
+				.. "The child starts empty. The harness runs `goals` one by one "
+				.. "and a validator checks each result before the next. "
+				.. "Only one subtask per turn; other tools may run together.",
 			parameters = {
 				type = "object",
 				properties = {
+					goals = {
+						type = "array",
+						items = { type = "string" },
+						description =
+						"Granular goals, one action each. "
+							.. "The harness runs them in order and validates each. "
+							.. "Prefer this over a single broad goal.",
+					},
 					goal = {
 						type = "string",
 						description =
-						"The child's only briefing besides NOTES. "
+						"Single goal if `goals` is omitted. "
 							.. "One action + one target, narrower than the current Goal. "
 							.. "Include every path, name, and constraint. "
-							.. "Say what fact to return (name, path, yes/no). "
-							.. "Do not ask the child to return code or dumps.",
+							.. "Say what fact to return (name, path, yes/no).",
+					},
+					role = {
+						type = "string",
+						description =
+						"orchestrator, coder, or validator. "
+							.. "Use coder for work. Omit to infer from tools.",
 					},
 					tools = {
 						type = "array",
@@ -103,8 +119,15 @@ M.defs = {
 						"Tools the child needs for its goal, not a copy of yours. "
 							.. "You may grant tools you cannot call. "
 							.. "Example: [\"shell\"] to grep, [\"read\"] to open a file. "
-							.. "If the child still needs more than one shot, also pass \"subtask\". "
-							.. "Omit for a coordinator (subtask+notes only).",
+							.. "Coder default is read/shell/notes. "
+							.. "Omit for an orchestrator (subtask+notes).",
+					},
+					step = {
+						type = "number",
+						description =
+						"1-based index into the caller's plan. "
+							.. "The child gets that item's goal, agent, and notes. "
+							.. "Prefer this after writing a plan.",
 					},
 					system_prompt = {
 						type = "string",
@@ -113,6 +136,64 @@ M.defs = {
 				},
 				additionalProperties = false,
 				required = { "goal" },
+			},
+		},
+	},
+	plan = {
+		type = "function",
+		["function"] = {
+			name = "plan",
+			description =
+			"Structured plan tree for your branch. Each item has agent (coder or orchestrator), "
+				.. "status, goal, notes, and optional children. Write replaces your branch. "
+				.. "Update can use index 2 or path 1.2. The top orchestrator can edit any node. "
+				.. "A branch orchestrator can edit only its children. Dispatch with subtask step=N.",
+			parameters = {
+				type = "object",
+				properties = {
+					action = {
+						type = "string",
+						description = "write (replace this branch), update (one item), status",
+						enum = { "write", "update", "status" },
+					},
+					items = {
+						type = "array",
+						description = "Branch items for write. Each: agent, goal, notes, children.",
+						items = {
+							type = "object",
+							properties = {
+								agent = { type = "string", description = "coder or orchestrator" },
+								goal = { type = "string" },
+								notes = { type = "string" },
+								status = { type = "string" },
+								tools = {
+									type = "array",
+									items = { type = "string" },
+									description = "Tools for a coder item, e.g. read, shell, edit",
+								},
+								children = {
+									type = "array",
+									items = { type = "object" },
+									description = "Nested plan items",
+								},
+							},
+						},
+					},
+					index = {
+						type = "string",
+						description = "Item to update: 2 or 1.2 (relative to this branch)",
+					},
+					path = {
+						type = "string",
+						description = "Same as index (dotted path, relative to this branch)",
+					},
+					agent = { type = "string" },
+					goal = { type = "string" },
+					notes = { type = "string" },
+					status = { type = "string" },
+				},
+				additionalProperties = false,
+				required = { "action" },
 			},
 		},
 	},
