@@ -1,0 +1,2827 @@
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tai e6cadad</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>tai</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit e6cadad
+parent <a href=commit-4bf9624.html>4bf9624</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-08-26T22:37:01-03:00
+
+    Add roles, plan tree, and harness-side validation.
+
+    Orchestrators only plan and dispatch (subtask, notes, plan). Coders
+    iterate on one goal. A validator checks each return (ok / missing /
+    blocked) against the goal, this agent's tools, and its diffs. The
+    handoff carries short discoveries so the caller can copy them into notes.
+
+<a href=tree-e6cadad.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 36ebf26..6b89352 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -27,31 +27,47 @@ These notes are intended for **automated coding agents** working in this reposit
+ ## Agent harness (runtime)
+ 
+ ```
+-stack[1] = MAIN frame (history + goal + steps; multi-turn; tool: subtask)
+-stack[2+] = isolated SUBTASK (history = goal only; steps in system prompt)
+-
+-each frame.steps = completed sibling steps at that level
+-  { text = child goal, response = child outcome }
++stack[1] = MAIN orchestrator (history + plan tree + subtask/notes/plan)
++stack[2+] = isolated child (history = current goal only)
++
++roles: orchestrator | coder | validator
++  orchestrator tools are fixed: subtask, notes, plan
++  plan is a tree; a branch orchestrator edits only its children
++  the top orchestrator can edit any node (path 1.2)
++  each plan item: agent, status, goal, notes, children
++  coder gets that item's goal + TASK NOTES
++  harness asks orchestrator to decompose a goal, then runs pending leaves
++  after a child returns, harness asks: update the plan? then runs pending
++  orchestrator hands off like a coder: text reply, no tool call
++  validator is harness-spawned: ok | missing: | blocked:
++
++before a worker returns, the harness calls validator with goal + result + notes.
++missing retries the same worker (max 2) with that next action.
++blocked returns to the parent as a failed step (no retry). The parent must replan.
++ok marks the plan item and returns. The parent updates later items, then next step.
+ 
+ each request (ephemeral):
+-  system = base_prompt
++  system = role prompt
+          + granted / grantable tools
+          + NOTES (shared pad)
++         + TASK NOTES (this plan item only)
++         + PLAN (caller's structured plan)
+          + LIVE CONTEXT (previous steps at this level; isolated only)
+          + MCP Servers state
+-
+-answer if the goal is fully addressed, else subtask one step.
+-notes is the shared channel between agents.
+-when a child returns, the parent is asked again.
+-it does not see the user's chat; its final text is the step response.
+ ```
+ 
+-- Main tools: `subtask`, `notes`
+-- Child tools: those listed in `subtask.tools` (default: `subtask`, `notes`)
+-- Pass read/shell/edit for a one-shot leaf. Omit `tools` to make a coordinator.
+-- `run_tools` rejects names not on the frame allowlist (models can still hallucinate tools).
+-- Notes are global (one pad for the stack) and injected every turn for main and workers
+-- `notes` does not end a worker (briefing); work tools still end a leaf
++- Main tools: `subtask`, `notes`, `plan` (role: orchestrator)
++- `plan` tool: write / update / status. Items: agent, status, goal, notes
++- `subtask.step`: 1-based plan index; child inherits that item's goal, agent, notes
++- `subtask.role`: orchestrator | coder | validator (default inferred from tools or plan item)
++- `subtask.goals`: list of granular goals if not using the plan
++- Coder default tools: `read`, `shell`, `notes`. Orchestrator default: `subtask`, `notes`, `plan`
++- Validator has no tools. Do not rely on the coder to call it.
++- `run_tools` rejects names not on the frame allowlist
++- Notes are global (one pad for the stack) and injected every turn
++- `notes` / `plan` do not end a worker. Coders keep tool history and iterate
++  until they reply with no tool call (cap `MAX_CODER_TURNS`). Then validator runs.
++- Isolated orchestrators still wipe to goal-only after a tool round.
+ - Isolated workers see sibling step reports via Live Context, not chat history
+ - Skills (Agent Skills spec): dirs under `~/.config/tai/skills/` and `&lt;project&gt;/.tai-skills/`, each with `SKILL.md`
+   - Required frontmatter: `name` (1–64, `[a-z0-9-]+`, match dir name) + `description` (1–1024, non-empty)
+@@ -59,6 +75,7 @@ it does not see the user's chat; its final text is the step response.
+ - Max depth: 8
+ - No `todos` tool — progress is Goal + Previous steps in Live Context
+ - No `complete` tool — final assistant text or tool output is the handoff
++- Coder handoff: what was done + short discoveries (paths, names, facts). Orchestrator copies those into notes.
+ 
+ ## MCP
+ 
+diff --git a/README.md b/README.md
+index 27ffafc..8830516 100644
+--- a/README.md
++++ b/README.md
+@@ -32,58 +32,70 @@
+ 
+ ```
+ ┌──────────────────────────────────────────────────────────────┐
+-│  MAIN (multi-turn, subtask + notes)                          │
+-│  Live Context: shared notes                                  │
+-│                                                              │
+-│   reply if done, else subtask(one concrete next step)        │
++│  MAIN orchestrator (fixed: subtask + notes + plan)           │
++│  harness: break this goal into smaller tasks?                │
++│  then run pending; after return: update the plan?            │
+ │        │                                                     │
+ │        ▼                                                     │
+-│   ┌──────────────────────────────────────────────────────┐   │
+-│   │  SUBTASK (clean history)  fold                       │   │
+-│   │  Goal + Previous steps at this level                 │   │
+-│   │  work, or subtask, then next step or reply           │   │
+-│   └──────────────────────┬───────────────────────────────┘   │
+-│                          │ step recorded as previous step    │
+-│                          ▼                                   │
+-│   next subtask, or answer the user                           │
++│   CODER / branch orch  (goal + TASK NOTES)                   │
++│        │ text reply (no tool)                                │
++│        ▼                                                     │
++│   VALIDATOR (goal + result + task notes)                     │
++│        │ ok / blocked → return                               │
++│        │ missing → coder retries that action                 │
++│        ▼                                                     │
++│   orchestrator plan.update later items, then step=N+1        │
+ └──────────────────────────────────────────────────────────────┘
+ ```
+ 
+ **Rules of the harness:**
+ 
+-1. No `todos` tool. Agents **answer** or call **`subtask`** (one step).
+-2. Answer only if it fully addresses the goal. A subtask is one step
+-   toward that goal.
+-3. When a child returns, its report is injected into the parent’s system
+-   prompt and the parent is asked again. The child’s final text is the result.
+-4. Max depth is 8. A child may nest only if granted `subtask`. Pass a
+-   `read`/`shell`/`edit` for a leaf; omit `tools` for a coordinator.
+-   Ungranted tools are denied.
+-5. Main is the orchestrator (`subtask` + shared `notes`). Work happens in subagents.
++1. Roles: **orchestrator** (plan and dispatch), **coder** (do one goal over
++   as many tool turns as needed), **validator** (`ok`, `missing:`, or
++   `blocked:`). Each has its own system prompt.
++2. Orchestrator tools are fixed (`subtask`, `notes`, `plan`). The plan is a
++   **tree**. A branch orchestrator edits only its children; the top one can
++   change any node (`1.2`). Each item has `agent`, `status`, `goal`, `notes`.
++   Dispatch with `subtask.step`. The child gets that item's goal and notes.
++   When the branch is done, the orchestrator replies in text (same handoff
++   as a coder).
++3. Before a worker returns, the harness calls the validator. `missing`
++   retries the coder (max 2) with that next action. `blocked` returns
++   the step as a failure so the orchestrator can change later items.
++   `ok` marks the plan item done.
++4. After a return, the caller is asked again so it can `plan.update`
++   later items, then send the next step. Answer only when the request is done.
++5. Max depth is 8. Ungranted tools are denied. Validator has no tools.
+ 
+ ### Subtask tool parameters
+ 
+ | Field | Required | Description |
+ |---|---|---|
+-| `goal` | yes | The next step (paths, action). Must not copy the current Goal |
+-| `tools` | no | Child tools. Default is `subtask` + `notes`. Pass `read`/`shell`/`edit` for a leaf. |
+-| `system_prompt` | no | Override the default worker prompt |
++| `step` | no | 1-based index into the caller's plan. Child gets that item's goal, agent, and notes |
++| `goal` | yes* | One action if you are not using `step` / `goals` |
++| `goals` | no | Granular goals. The harness runs and validates each in order |
++| `role` | no | `orchestrator`, `coder`, or `validator`. Inferred from the plan item or tools |
++| `tools` | no | Child tools. Coder default is `read`/`shell`/`notes`. Orchestrator default is `subtask`/`notes`/`plan` |
++| `system_prompt` | no | Override the role prompt |
+ 
+ Examples:
+ 
+ ```json
+ {
+-  "goal": "List lua/tai and report which file defines main_tools.",
+-  "tools": ["read", "shell"]
++  "action": "write",
++  "items": [
++    { "agent": "coder", "goal": "List lua/tai and name session-load files.", "notes": "Project root is the cwd." },
++    { "agent": "coder", "goal": "Read the load function.", "notes": "Fill this after step 1." }
++  ]
+ }
+ ```
+ 
+ ```json
+-{
+-  "goal": "In lua/tai/agent.lua, change main_tools to only subtask. Minimal diff.",
+-  "tools": ["read", "edit"],
+-  "system_prompt": "You are a careful implementer. Do not freestyle architecture."
+-}
++{ "step": 1, "tools": ["read", "shell"] }
++```
++
++```json
++{ "action": "update", "index": 2, "goal": "Read lua/tai/context.lua 1:80", "notes": "load() is in context.lua" }
+ ```
+ 
+ ## Providers
+@@ -261,12 +273,13 @@ Example `.tai` file:
+ | `send_image` | Send images for visual analysis |
+ | `edit` | Search-and-replace edit (`multi` flag supported) |
+ | `write` | Create new files |
+-| `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
++| `subtask` | Child agent (`step` into the plan, or `goal` / `goals`, optional `role` / `tools`) |
++| `plan` | Structured plan: write / update / status (`agent`, `status`, `goal`, `notes`) |
+ | `notes` | Write/append the shared notepad (injected every turn for main and workers) |
+ | `mcp` | MCP status / connect / disconnect / list_tools / call |
+ 
+-Main and default children get `subtask` + `notes`. Pass `read`/`shell`/`edit`
+-in `tools` for a one-shot leaf.
++Main is an orchestrator (`subtask` + `notes` + `plan`). Coders default to
++`read` / `shell` / `notes`. A validator checks each return before the parent continues.
+ 
+ ### `mcp` tool
+ 
+diff --git a/lua/tai/agent.lua b/lua/tai/agent.lua
+index 48e08f7..24fb016 100644
+--- a/lua/tai/agent.lua
++++ b/lua/tai/agent.lua
+@@ -2,12 +2,22 @@ local M = {}
+ 
+ local config = require("tai.config")
+ local skills = require("tai.skills")
++local plan = require("tai.tools.plan")
++local changes = require("tai.tools.changes")
+ 
+ if not config.root then
+ 	return M
+ end
+ 
+ M.MAX_DEPTH = 8
++M.MAX_VALIDATE_RETRIES = 2
++M.MAX_CODER_TURNS = 12
++
++M.ROLES = {
++	orchestrator = true,
++	coder = true,
++	validator = true,
++}
+ 
+ local guide = [[
+ Coding guidelines
+@@ -15,42 +25,81 @@ Coding guidelines
+ - Do the work. Do not stop at a plan or a promise.
+ - Do not assume what exists. List the project, then open what you find.
+ - Decide only from tool results, notes, and previous steps. Never guess paths.
+-- NOTES is the only shared memory. Write short facts others need (paths, names, findings). No plans or dumps.
+-- A child starts empty: it sees only its goal, NOTES, and previous steps at its level.
+-- Put every path, name, and constraint in the child's goal. Write durable facts to notes before you spawn.
++- Shared NOTES is for facts every agent needs. Each plan item has its own notes for that task only.
++- A child starts empty: it sees its current goal, TASK NOTES, shared NOTES, and previous steps at its level.
+ - Grep to search (use -A/-B). Do not read a whole file to search.
+ - Read only a range; edit needs the previous content, not line numbers.
+ - Be efficient. Completely address the goal. No markdown, use ASCII.
+-- Use only tools you may call. If you need a tool you cannot call, subtask and grant that tool to the child.
++- Use only tools you were given. Do not call subtask unless it is listed.
+ ]]
+ 
+ M.system_prompt = [[
+ You are the orchestrator for this project: ]] .. config.root .. [[
+ 
+-You cannot read, edit, or run commands. Your agents do the work.
+-You only reply to the user or call subtask.
+-- A child starts empty. It cannot see this chat. Put every path, name, and constraint in the goal. Write durable facts to notes before you spawn.
+-- Answer only when the request is fully addressed from notes or step reports. Do not invent.
+-- Otherwise subtask one concrete next step. Grant the child the tools that step needs (read/shell/edit), even if you cannot call them.
+-- If that step still needs more than one shot, also grant subtask.
+-- Notes is shared. No markdown, use ASCII.
++You cannot read, edit, or run commands. Your tools are only subtask, notes, and plan.
++You will receive a goal or a plan. Analyse it and decide the next step.
++When the work is done, reply in text with no tool call.
++No markdown, use ASCII.
+ 
+ ]]
+ 
+-M.subtask_system_prompt = [[
+-You are an agent for this project: ]] .. config.root .. [[
++M.decompose_prompt = [[
++You are the orchestrator for this project: ]] .. config.root .. [[
++
++You cannot do the work. Tools: plan, notes.
++You will receive a goal. Analyse it and answer if you should split it into smaller tasks.
++- If it is already one action, say it is a leaf. Do not invent extra steps.
++- If it needs several actions, write a plan of children.
++  Each item: agent (coder or orchestrator), goal, notes, optional tools for a coder.
++- Coders do one concrete action. Orchestrators own a subtree that still needs splitting.
++- Then stop. Pending work will be run for you.
++
++]]
++
++M.revise_prompt = [[
++You are the orchestrator for this project: ]] .. config.root .. [[
++
++You cannot do the work. Tools: plan, notes.
++You will receive a plan and the last task's output. Analyse them and answer if you need to update later items (goal, notes, agent, tools).
++- Copy useful discoveries from the output into notes (shared NOTES, or later items' notes).
++- Do not repeat a finished step. If something was blocked, change what comes next.
++- If the plan is fine, say so.
++- If nothing is left to run, reply with the result of your goal. Include short discoveries from the reports.
++
++]]
+ 
+-Answer or call subtask:
+-- Do the goal. Answer only when it is fully done from notes, previous steps, or this turn.
+-- A child starts empty. Put every path, name, and constraint in its goal. Write durable facts to notes before you spawn.
+-- Use only tools you may call. Grant a child the tools it needs, even ones you cannot call.
+-- If you have read/shell/edit and the task is one shot, do the work. Do not subtask it.
+-- If the goal is simple but you cannot do it, say what is missing. Do not copy or rephrase it as a subtask.
+-- Otherwise subtask one smaller step. Give it the tools for that goal, not a copy of yours.
+-- If that step still needs more than one shot, also grant subtask.
++M.coder_prompt = [[
++You are a coder for this project: ]] .. config.root .. [[
++
++Do this one goal. Do not plan the whole request. A validator will check your result.
++- You get this task's goal and TASK NOTES. Use them. You do not see later plan items.
++- You may take several turns (read, then grep, then edit). Keep going until the goal is done.
++- When it is done, reply in text with no tool call. That reply is the handoff to the caller.
++- The handoff is: what you did, then short discoveries later steps need (paths, names, facts). No file dumps.
++- Use only tools you were given. Do not call subtask unless it is listed.
++- If a path, file, or name in the goal does not exist, say so in the handoff (invalid premise). Do not invent other files or a different task.
++- If the goal cannot be done, say why. Do not invent.
+ 
+ ]] .. guide
+ 
++M.validator_prompt = [[
++You are the validator for this project: ]] .. config.root .. [[
++
++Judge only. You have no tools. Do not solve the Goal. Do not invent work.
++You will receive a Goal, a Result, Tools this agent called (no output), and Changes (this agent's edits only).
++Decide only against that Goal. Do not invent new tool calls.
++Reply with exactly one of:
++ok
++missing: &lt;the undone part of the Goal, in the Goal's own words&gt;
++blocked: &lt;a premise in the Goal is false&gt;
++- missing must quote or restate a piece of the Goal. No new commands, files, or tasks.
++- If the Result says a path or name from the Goal does not exist, that is blocked, not missing.
++- A plan or a promise is not ok.
++
++]]
++
++M.subtask_system_prompt = M.coder_prompt
++
+ M.system_prompt = config.system_prompt or M.system_prompt
+ if config.custom_prompt and config.custom_prompt ~= "" then
+ 	M.system_prompt = M.system_prompt .. "\n" .. config.custom_prompt
+@@ -65,23 +114,48 @@ end
+ M.main_tools = {
+ 	"subtask",
+ 	"notes",
++	"plan",
+ }
+ 
+ -- Names a child may be granted.
+ M.subtask_tools = {
+-	"read", "shell", "send_image", "edit", "write", "notes", "subtask", "skill", "mcp",
++	"read", "shell", "send_image", "edit", "write", "notes", "plan", "subtask", "skill", "mcp",
+ }
+ 
+ -- Default child is a coordinator, like main. Work tools only if the parent lists them.
+ M.default_child_tools = {
+ 	"subtask",
+ 	"notes",
++	"plan",
++}
++
++-- Coder with no tools listed can still inspect the repo.
++M.coder_tools = {
++	"read",
++	"shell",
++	"edit",
++	"notes",
++}
++
++M.role_label = {
++	orchestrator = "ORCHESTRATOR",
++	coder = "CODER",
++	validator = "VALIDATOR",
++}
++
++local work_tool = {
++	read = true,
++	shell = true,
++	edit = true,
++	write = true,
++	send_image = true,
+ }
+ 
+ -- One-liners for the prompt. Schema text stays on the tool defs.
+ M.tool_blurb = {
+-	subtask = "spawn one smaller step; grant the child the tools that step needs",
+-	notes = "shared pad; write facts a child will need before you spawn",
++	subtask = "spawn a plan step (step=N) or a one-off goal; grant the tools that step needs",
++	notes = "shared pad for facts every agent needs",
++	plan = "write or update the structured plan (agent, status, goal, notes per item)",
+ 	read = "open a file or line range",
+ 	shell = "run a command in the project root",
+ 	edit = "replace text in a file",
+@@ -153,34 +227,185 @@ function M.sanitize_subtask_tools(tools)
+ 	return out
+ end
+ 
++function M.parse_role(role, opts)
++	opts = opts or {}
++	if type(role) == "string" then
++		role = role:lower():match("^%s*(.-)%s*$") or role
++		if role == "manager" then
++			role = "orchestrator"
++		end
++		if M.ROLES[role] then
++			return role
++		end
++	end
++	if opts.profile == "subtask" and type(opts.tools) == "table" then
++		for _, name in ipairs(opts.tools) do
++			if work_tool[name] then
++				return "coder"
++			end
++		end
++		return "orchestrator"
++	end
++	return "orchestrator"
++end
++
++function M.parse_goals(goal, goals)
++	local out = {}
++	local function add(g)
++		if type(g) == "number" then
++			g = tostring(g)
++		end
++		if type(g) == "string" then
++			g = g:match("^%s*(.-)%s*$") or g
++			if g ~= "" then
++				table.insert(out, g)
++			end
++		end
++	end
++	if type(goals) == "table" then
++		for _, g in ipairs(goals) do
++			add(g)
++		end
++	end
++	if #out == 0 then
++		add(goal)
++	end
++	return out
++end
++
++function M.tools_for_role(role, tools)
++	if role == "validator" then
++		return {}
++	end
++	if role == "orchestrator" then
++		return vim.deepcopy(M.main_tools)
++	end
++	local out = {}
++	if type(tools) == "table" then
++		for _, name in ipairs(tools) do
++			if subtask_tool_set[name] then
++				table.insert(out, name)
++			end
++		end
++	end
++	if #out &gt; 0 then
++		return out
++	end
++	if role == "coder" then
++		return vim.deepcopy(M.coder_tools)
++	end
++	return vim.deepcopy(M.main_tools)
++end
++
++function M.iterates(frame)
++	if not frame then
++		return false
++	end
++	if frame.role == "coder" then
++		return true
++	end
++	return frame.role == "orchestrator" and frame.isolated == true
++end
++
++function M.prompt_for(role, phase)
++	if role == "coder" then
++		return M.coder_prompt
++	end
++	if role == "validator" then
++		return M.validator_prompt
++	end
++	if phase == "decompose" then
++		return M.decompose_prompt
++	end
++	if phase == "revise" then
++		return M.revise_prompt
++	end
++	return M.system_prompt
++end
++
++function M.weak_phase_reply(text)
++	if type(text) ~= "string" then
++		return true
++	end
++	local s = text:lower():gsub("^%s+", ""):gsub("%s+$", "")
++	if s == "" then
++		return true
++	end
++	if s == "no" or s == "ok" or s == "yes" or s == "leaf" then
++		return true
++	end
++	if s:match("^no[,%.]") or s:match("^ok[,%.]") then
++		return true
++	end
++	if s:match("^it is a leaf") or s:match("^this is a leaf") or s:match("^looks good") then
++		return true
++	end
++	if s:match("^do not update") or s:match("^no update") or s:match("^plan is fine") then
++		return true
++	end
++	return false
++end
++
+ --- Build a new agent frame.
+---- opts: profile ("main"|"subtask"), system_prompt?, tools?, goal?,
+----       steps?, depth?, parent_call_id?
++--- opts: profile ("main"|"subtask"), role?, system_prompt?, tools?,
++---       goal?, goals?, steps?, depth?, parent_call_id?
+ function M.new_frame(opts)
+ 	opts = opts or {}
+ 
+ 	local is_sub = opts.profile == "subtask"
+-	local system = opts.system_prompt
+-		or (is_sub and M.subtask_system_prompt or M.system_prompt)
++	local role = is_sub and M.parse_role(opts.role, opts) or "orchestrator"
++	local phase = opts.phase
++	if not phase and role == "orchestrator" then
++		phase = "decompose"
++	end
++	local system = opts.system_prompt or M.prompt_for(role, phase)
++	local goals = M.parse_goals(opts.goal, opts.goals)
++	local goal = goals[1]
+ 
+-	local tool_list = is_sub
+-		and M.sanitize_subtask_tools(opts.tools)
+-		or (opts.tools or M.main_tools)
++	local tool_list = M.tools_for_role(role, is_sub and opts.tools or nil)
++	if not is_sub then
++		tool_list = vim.deepcopy(M.main_tools)
++	end
++
++	local root = opts.plan_root
++	local path = opts.plan_path
++	if type(root) ~= "table" then
++		root = plan.sanitize(opts.plan)
++		path = {}
++	elseif type(path) ~= "table" then
++		path = {}
++	end
+ 
+ 	local frame = {
+-		label = is_sub and "SUBTASK" or "MAIN",
++		label = is_sub and (M.role_label[role] or "SUBTASK") or "MAIN",
++		role = role,
+ 		system_prompt = system,
+ 		tools = tool_list,
+ 		history = { { role = "system", content = system } },
+-		goal = opts.goal,
++		goal = goal,
++		original_goal = goal,
++		goals = goals,
++		goal_index = 1,
+ 		steps = vim.deepcopy(opts.steps or {}),
+ 		isolated = is_sub,
+ 		depth = opts.depth or 0,
+ 		parent_call_id = opts.parent_call_id,
+ 		tool_outputs = {},
++		validate_retries = 0,
++		turns = 0,
++		plan = root,
++		plan_root = root,
++		plan_path = path,
++		task_notes = opts.task_notes or "",
++		plan_step = opts.plan_step,
++		phase = phase,
++		file_changes = {},
++		changed_set = {},
++		commands = {},
++		git_dirty = (role == "coder") and changes.snapshot(config.root) or {},
+ 	}
+-	if opts.goal and opts.goal ~= "" then
+-		table.insert(frame.history, { role = "user", content = opts.goal })
++	if goal and goal ~= "" then
++		table.insert(frame.history, { role = "user", content = goal })
+ 	end
+ 	return frame
+ end
+diff --git a/lua/tai/tests/subtask_test.lua b/lua/tai/tests/subtask_test.lua
+index 5b46aab..3111031 100644
+--- a/lua/tai/tests/subtask_test.lua
++++ b/lua/tai/tests/subtask_test.lua
+@@ -45,7 +45,11 @@ assert_true(tools.defs.todos == nil, "todos tool removed")
+ local p = tools.defs.subtask["function"].parameters
+ assert_true(vim.tbl_contains(p.required, "goal"), "goal required")
+ assert_true(p.properties.id == nil, "no todo id field")
++assert_true(p.properties.goals ~= nil, "goals list field")
++assert_true(p.properties.role ~= nil, "role field")
++assert_true(p.properties.step ~= nil, "step field")
+ assert_true(p.properties.system_prompt ~= nil, "system_prompt optional field")
++assert_true(tools.defs.plan ~= nil, "plan tool exists")
+ 
+ print("\n=== agent frames ===")
+ local main = agent.new_frame({ profile = "main" })
+@@ -53,6 +57,7 @@ assert_eq("MAIN", main.label, "main label")
+ assert_true(not main.isolated, "main shares the user chat")
+ assert_true(vim.tbl_contains(main.tools, "subtask"), "main has subtask")
+ assert_true(vim.tbl_contains(main.tools, "notes"), "main has notes")
++assert_true(vim.tbl_contains(main.tools, "plan"), "main has plan")
+ assert_true(not vim.tbl_contains(main.tools, "todos"), "main has no todos")
+ assert_true(not vim.tbl_contains(main.tools, "edit"), "main has no edit")
+ 
+@@ -62,7 +67,8 @@ local child = agent.new_frame({
+ 	tools = { "read", "shell", "subtask", "edit" },
+ 	goal = "Review foo.lua exports",
+ })
+-assert_eq("SUBTASK", child.label, "subtask label")
++assert_eq("CODER", child.label, "work tools infer coder")
++assert_eq("coder", child.role, "child role")
+ assert_true(child.isolated, "child has a clean history")
+ assert_eq("Review foo.lua exports", child.goal, "child goal")
+ assert_eq(0, #child.steps, "child starts with no steps")
+@@ -105,26 +111,58 @@ assert_true(not agent.tool_granted({ "subtask" }, ""), "empty name")
+ assert_true(not agent.tool_granted({ "subtask" }, nil), "nil name")
+ 
+ print("\n=== orchestrator prompt ===")
+-assert_true(main.system_prompt:find("cannot read, edit, or run commands", 1, true),
++assert_true(agent.system_prompt:find("cannot read, edit, or run commands", 1, true),
+ 	"main cannot work itself")
+-assert_true(main.system_prompt:find("only reply to the user or call subtask", 1, true),
++assert_true(agent.system_prompt:find("Coders do the work", 1, true)
++	or agent.decompose_prompt:find("You cannot do the work", 1, true),
+ 	"main only delegates")
+-assert_true(main.system_prompt:find("even if you cannot call them", 1, true),
+-	"main grants tools it cannot call")
++assert_true(agent.system_prompt:find("subtask, notes, and plan", 1, true),
++	"main writes a plan first")
++assert_true(main.phase == "decompose", "main starts by decomposing")
+ assert_true(not main.system_prompt:find("List the project", 1, true),
+ 	"main has no work guide")
+ local default_prompt = agent.new_frame({ profile = "subtask", goal = "Look" })
+-assert_true(default_prompt.system_prompt:find("even ones you cannot call", 1, true),
+-	"child may grant tools it cannot call")
++assert_eq("orchestrator", default_prompt.role, "default child is orchestrator")
++assert_true(default_prompt.system_prompt:find("break this goal", 1, true)
++	or default_prompt.phase == "decompose",
++	"default child starts in decompose")
++assert_eq("decompose", default_prompt.phase, "new orchestrator decomposes")
++assert_true(agent.decompose_prompt:find("smaller tasks", 1, true),
++	"decompose prompt exists")
++assert_true(agent.revise_prompt:find("update later items", 1, true),
++	"revise prompt exists")
++local coder_prompt = agent.new_frame({ profile = "subtask", role = "coder", goal = "Edit x" })
++assert_true(coder_prompt.system_prompt:find("Do this one goal", 1, true),
++	"coder stays on one goal")
++assert_true(coder_prompt.system_prompt:find("several turns", 1, true),
++	"coder may iterate")
++assert_true(coder_prompt.system_prompt:find("invalid premise", 1, true),
++	"coder reports missing files")
++assert_true(coder_prompt.system_prompt:find("Do not call subtask unless it is listed", 1, true),
++	"coder is not told to subtask by default")
++assert_true(coder_prompt.system_prompt:find("short discoveries", 1, true),
++	"coder handoff includes discoveries")
++assert_true(agent.revise_prompt:find("Copy useful discoveries", 1, true),
++	"revise copies discoveries into notes")
++assert_true(agent.validator_prompt:find("in the Goal's own words", 1, true),
++	"validator may not invent work")
++assert_true(agent.iterates(coder_prompt), "coder iterates")
++assert_true(not agent.iterates(main), "main does not iterate tools")
++assert_true(agent.iterates(default_prompt), "isolated orchestrator iterates")
++assert_true(not agent.iterates(vframe), "validator does not iterate")
++assert_eq(12, agent.MAX_CODER_TURNS, "coder turn cap")
++local vframe = agent.new_frame({ profile = "subtask", role = "validator", goal = "check" })
++assert_eq(0, #vframe.tools, "validator has no tools")
++assert_true(vframe.system_prompt:find("Judge only", 1, true), "validator judges")
+ 
+ print("\n=== render_tools ===")
+ assert_eq("", agent.render_tools(nil), "nil list is empty")
+ assert_eq("", agent.render_tools({}), "empty list is empty")
+ local granted = agent.render_tools({ "subtask", "notes" })
+ assert_match("You may call only:", granted, "call header")
+-assert_match("%- subtask: spawn one smaller step", granted, "describes subtask")
++assert_match("%- subtask: spawn a plan step", granted, "describes subtask")
+ assert_match("%- notes: shared pad", granted, "describes notes")
+-assert_match("before you spawn", granted, "notes is for briefing")
++assert_match("%- plan: write or update", granted, "describes plan")
+ assert_match("including ones you cannot call:", granted, "grant header")
+ assert_match("%- shell: run a command", granted, "describes shell for granting")
+ assert_match("%- read: open a file", granted, "describes read for granting")
+@@ -134,6 +172,185 @@ assert_match("%- read: open a file", leaf_cat, "leaf describes granted")
+ assert_true(not leaf_cat:find("including ones you cannot call", 1, true), "leaf has no grant list")
+ assert_true(not leaf_cat:find("- shell:", 1, true), "leaf does not advertise shell")
+ 
++print("\n=== roles and goals ===")
++assert_eq("orchestrator", agent.parse_role("manager"), "manager alias")
++assert_eq("coder", agent.parse_role(nil, { profile = "subtask", tools = { "read" } }), "infer coder")
++assert_eq("orchestrator", agent.parse_role(nil, { profile = "subtask", tools = { "subtask" } }), "infer orchestrator")
++local gs = agent.parse_goals(nil, { " list a ", "", "read b" })
++assert_eq(2, #gs, "drops empty goals")
++assert_eq("list a", gs[1], "trims goals")
++assert_eq("read b", gs[2], "keeps second")
++assert_eq("only", agent.parse_goals("only", nil)[1], "single goal")
++local coder_def = agent.tools_for_role("coder", nil)
++assert_true(vim.tbl_contains(coder_def, "read"), "coder default has read")
++assert_true(not vim.tbl_contains(coder_def, "subtask"), "coder default does not nest")
++assert_eq(0, #agent.tools_for_role("validator", { "shell" }), "validator strips tools")
++local orch_tools = agent.tools_for_role("orchestrator", { "read", "shell", "edit" })
++assert_eq(3, #orch_tools, "orchestrator has fixed tool count")
++assert_true(vim.tbl_contains(orch_tools, "subtask"), "orchestrator has subtask")
++assert_true(vim.tbl_contains(orch_tools, "notes"), "orchestrator has notes")
++assert_true(vim.tbl_contains(orch_tools, "plan"), "orchestrator has plan")
++assert_true(not vim.tbl_contains(orch_tools, "read"), "orchestrator cannot take read")
++local forced = agent.new_frame({
++	profile = "subtask",
++	role = "orchestrator",
++	tools = { "read", "shell" },
++	goal = "Coordinate",
++})
++assert_true(not vim.tbl_contains(forced.tools, "read"), "orchestrator frame drops work tools")
++assert_true(agent.system_prompt:find("reply in text with no tool call", 1, true)
++	or agent.revise_prompt:find("handoff", 1, true),
++	"orchestrator knows how to hand off")
++local queued = agent.new_frame({
++	profile = "subtask",
++	role = "coder",
++	goals = { "list lua/tai", "read agent.lua 1:20" },
++})
++assert_eq(2, #queued.goals, "stores goal list")
++assert_eq("list lua/tai", queued.goal, "current is first")
++assert_eq(1, queued.goal_index, "starts at first")
++
++print("\n=== validator verdict ===")
++assert_eq("ok", mem.parse_verdict("ok"), "ok")
++assert_eq("ok", mem.parse_verdict("OK\nextra"), "ok first line")
++local v, miss = mem.parse_verdict("missing: read lua/tai/context.lua 1:40")
++assert_eq("missing", v, "missing verdict")
++assert_eq("read lua/tai/context.lua 1:40", miss, "missing action")
++assert_eq("missing", mem.parse_verdict(""), "empty is missing")
++local bv, why = mem.parse_verdict("blocked: lua/tai/nope.lua does not exist")
++assert_eq("blocked", bv, "blocked verdict")
++assert_eq("lua/tai/nope.lua does not exist", why, "blocked reason")
++assert_eq("blocked", mem.parse_verdict("blocked"), "blocked alone")
++local _, why2 = mem.parse_verdict("BLOCKED: No such path")
++assert_eq("No such path", why2, "blocked is case-insensitive")
++assert_match("blocked:", mem.validator_brief("list files", "agent.lua"), "brief lists blocked")
++assert_match("Goal:", mem.validator_brief("list files", "agent.lua"), "brief has goal")
++assert_match("agent%.lua", mem.validator_brief("list files", "agent.lua"), "brief has result")
++assert_match("Do not invent", mem.validator_brief("list files", "agent.lua"), "brief forbids new tasks")
++assert_true(not mem.validator_brief("g", "r"):find("Changes", 1, true), "no changes section when empty")
++local ch = require("tai.tools.changes")
++local fr = { file_changes = {}, changed_set = {} }
++ch.record_edit(fr, "a.lua", "old line", "new line")
++local rendered = ch.render(fr)
++assert_match("%-old line", rendered, "edit removes old")
++assert_match("%+new line", rendered, "edit adds new")
++ch.record_write(fr, "b.lua", "hello")
++assert_match("b%.lua", ch.render(fr), "write is included")
++ch.record_command(fr, "read: lua/tai/context.lua [1:80]", false)
++ch.record_command(fr, "find . -name '*.lua'", false)
++ch.record_command(fr, "edit: lua/tai/ui/core.lua", false)
++ch.record_command(fr, "ls nope", true)
++local cmds = ch.render_commands(fr)
++assert_match("read: lua/tai/context%.lua", cmds, "records read")
++assert_match("edit: lua/tai/ui/core%.lua", cmds, "records edit")
++assert_match("find %. %-name", cmds, "records command")
++assert_match("%[failed%]", cmds, "marks failed command")
++assert_true(not cmds:find("output", 1, true), "tool list has no output")
++local with_ch = mem.validator_brief("g", "r", ch.render(fr), cmds)
++assert_match("Changes %(this agent only%)", with_ch, "brief includes this agent's diff")
++assert_match("Tools %(this agent only", with_ch, "brief includes tools")
++assert_eq("", ch.render({}), "empty frame has no changes")
++assert_eq("", ch.render_commands({}), "empty frame has no commands")
++assert_true(mem.same_scope(
++	"Identify where session history is loaded",
++	"identify where session history is loaded"
++), "missing restates the goal")
++assert_true(not mem.same_scope(
++	"Identify where session history is loaded",
++	"run ls -R to map the directory"
++), "invented command is off scope")
++assert_true(not mem.same_scope(
++	"Identify where session history is loaded",
++	"Add a call to context.load in ui/core.lua"
++), "invented implementation is off scope")
++local miss_frame = { goal = "Identify where session history is loaded", original_goal = "Identify where session history is loaded" }
++mem.apply_missing(miss_frame, "run ls -R in the project")
++assert_eq("Identify where session history is loaded", miss_frame.goal, "invented missing does not replace the goal")
++assert_true(not (miss_frame.task_notes or ""):find("ls -R", 1, true), "invented missing is not stored")
++mem.apply_missing(miss_frame, "identify where session history is loaded")
++assert_match("Still undone from the Goal", miss_frame.task_notes, "on-scope missing is noted")
++
++print("\n=== plan ===")
++local plan = require("tai.tools.plan")
++local host = { plan = {} }
++local written = plan.run({
++	action = "write",
++	items = {
++		{ agent = "coder", goal = "list lua/tai", notes = "look for session load" },
++		{ agent = "manager", goal = "decide the file", notes = "" },
++		{ goal = "" },
++	},
++}, host)
++assert_match("2 steps", written, "write drops empty items")
++assert_eq("coder", host.plan[1].agent, "first is coder")
++assert_eq("orchestrator", host.plan[2].agent, "manager alias")
++assert_eq("pending", host.plan[1].status, "default pending")
++assert_eq("look for session load", host.plan[1].notes, "keeps item notes")
++plan.mark(host, 1, "ok", "found context.lua")
++assert_eq("ok", host.plan[1].status, "mark ok")
++local upd, uerr = plan.update(host, 2, { notes = "read lua/tai/context.lua", goal = "read the load fn" })
++assert_true(upd ~= nil, "update later item")
++assert_eq(nil, uerr, "update ok")
++assert_eq("read the load fn", host.plan[2].goal, "updated goal")
++assert_eq("read lua/tai/context.lua", host.plan[2].notes, "updated notes")
++assert_eq("pending", host.plan[2].status, "update keeps status")
++local rendered = plan.render(host.plan)
++assert_true(not rendered:find("=====", 1, true), "no plan fence")
++assert_match("1%. list lua/tai", rendered, "renders goal")
++assert_match("Notes: look for session load", rendered, "renders notes")
++assert_match("%[PENDING%]", rendered, "renders status tag")
++assert_match("%(coder %- read shell edit%)", rendered, "renders agent tools")
++assert_eq("", plan.render_task_notes(""), "empty task notes skip")
++assert_match("TASK NOTES", plan.render_task_notes("only this step"), "task notes fence")
++local tasked = agent.new_frame({
++	profile = "subtask",
++	role = "coder",
++	goal = "list lua/tai",
++	task_notes = "look for session load",
++	plan_step = 1,
++})
++assert_eq("look for session load", tasked.task_notes, "child carries task notes")
++assert_eq(1, tasked.plan_step, "child remembers plan step")
++
++print("\n=== plan tree ===")
++local topf = { plan = {}, role = "orchestrator", plan_path = {} }
++topf.plan_root = topf.plan
++plan.set(topf, {
++	{ agent = "orchestrator", goal = "implement load", notes = "branch" },
++	{ agent = "coder", goal = "sibling work" },
++})
++local branch = {
++	role = "orchestrator",
++	plan_root = topf.plan,
++	plan_path = { 1 },
++}
++plan.set(branch, {
++	{ agent = "coder", goal = "list files", notes = "cwd" },
++})
++assert_eq("list files", topf.plan[1].children[1].goal, "branch write is nested")
++assert_eq("sibling work", topf.plan[2].goal, "sibling untouched")
++plan.update(branch, 1, { notes = "filled" })
++assert_eq("filled", topf.plan[1].children[1].notes, "branch update is local")
++local _, berr = plan.update(branch, 2, { goal = "nope" })
++assert_true(berr ~= nil, "branch cannot update a missing sibling")
++plan.update(topf, "1.1", { goal = "list lua/tai" })
++assert_eq("list lua/tai", topf.plan[1].children[1].goal, "top can edit a deep node")
++local tree = plan.render(topf.plan)
++assert_match("1%.1%. list lua/tai", tree, "renders nested path")
++assert_true(not tree:find("=====", 1, true), "tree has no fence")
++assert_eq(1, plan.next_pending(branch), "branch next is its first child")
++plan.mark(topf, 1, "running")
++local n1, p1 = plan.next_pending(topf)
++assert_eq(2, n1, "top next pending skips running")
++assert_eq("sibling work", p1.goal, "pending sibling")
++plan.mark(topf, 2, "ok")
++assert_eq(nil, plan.next_pending(topf), "no pending left at top")
++local br = plan.render_for(branch)
++assert_match("branch: 1", br, "branch header")
++assert_match("list lua/tai", br, "branch sees its children")
++assert_true(not br:find("sibling work", 1, true), "branch does not see sibling")
++assert_eq("", plan.render_for({ role = "coder", plan = topf.plan }), "coder is not shown the plan")
++
+ print("\n=== sanitize_subtask_tools ===")
+ local leaf = agent.sanitize_subtask_tools({ "read", "shell" })
+ assert_eq(2, #leaf, "keeps a valid list")
+@@ -171,6 +388,18 @@ local stepped = mem.render_memory({
+ assert_match("LIVE CONTEXT", stepped, "steps open a live context fence")
+ assert_match("list lua/tai", stepped, "step text")
+ assert_match("found context%.lua", stepped, "step response")
++local orch_mem = mem.render_memory({
++	role = "orchestrator",
++	steps = { { text = "list lua/tai", response = "found context.lua" } },
++})
++assert_match("Update later plan items", orch_mem, "orchestrator revises after ok")
++local blocked_mem = mem.render_memory({
++	role = "orchestrator",
++	steps = { { text = "read nope.lua", response = "blocked: not found", status = "blocked" } },
++})
++assert_match("%[blocked%]", blocked_mem, "blocked step is tagged")
++assert_match("Last step was blocked", blocked_mem, "orchestrator must replan")
++assert_true(not blocked_mem:find("Last step was validated", 1, true), "blocked is not treated as ok")
+ 
+ local payload = mem.format_complete("ok", "looked around", { goal = "Read agent.lua" })
+ assert_match("status: ok", payload, "format_complete ok")
+@@ -182,6 +411,10 @@ local errp = mem.format_complete("error", "ERROR [429 Too Many Requests]: rate l
+ assert_match("status: error", errp, "format_complete error status")
+ assert_match("error: ERROR %[429", errp, "format_complete keeps 429")
+ 
++local blk = mem.format_complete("blocked", "file does not exist", { goal = "Read nope.lua" })
++assert_match("status: blocked", blk, "format_complete blocked status")
++assert_match("blocked: file does not exist", blk, "format_complete blocked reason")
++
+ print("\n=== handoff ===")
+ local short_out = mem.outcome_for({ tool_outputs = { "README.md\nAGENTS.md" } }, "")
+ assert_match("README.md", short_out, "empty reply forwards tool output")
+diff --git a/lua/tai/tools.lua b/lua/tai/tools.lua
+index 5a63f32..22d3064 100644
+--- a/lua/tai/tools.lua
++++ b/lua/tai/tools.lua
+@@ -5,6 +5,7 @@ local tools_io = require("tai.tools.io")
+ local tools_shell = require("tai.tools.shell")
+ local tools_edit = require("tai.tools.edit")
+ local tools_subtask = require("tai.tools.subtask")
++local tools_plan = require("tai.tools.plan")
+ local tools_skill = require("tai.tools.skill")
+ local tools_mcp = require("tai.tools.mcp")
+ 
+@@ -25,6 +26,8 @@ M.render_notes = tools_subtask.render_notes
+ M.render_memory = tools_subtask.render_memory
+ M.format_complete = tools_subtask.format_complete
+ M.run_notes = tools_subtask.run_notes
++M.run_plan = tools_plan.run
++M.render_plan = tools_plan.render
+ M.run_skill = tools_skill.run
+ M.run_mcp = tools_mcp.run
+ 
+@@ -80,21 +83,34 @@ M.defs = {
+ 		["function"] = {
+ 			name = "subtask",
+ 			description =
+-			"Spawn an agent for one smaller next step, not the whole Goal. "
+-				.. "The child starts empty: it sees only this goal, NOTES, and its own previous steps. "
+-				.. "`goal` must be a self-contained brief (paths, names, what fact to return). "
+-				.. "One tool call per turn.",
++			"Spawn an agent for granular next steps. "
++				.. "The child starts empty. The harness runs `goals` one by one "
++				.. "and a validator checks each result before the next. "
++				.. "Only one subtask per turn; other tools may run together.",
+ 			parameters = {
+ 				type = "object",
+ 				properties = {
++					goals = {
++						type = "array",
++						items = { type = "string" },
++						description =
++						"Granular goals, one action each. "
++							.. "The harness runs them in order and validates each. "
++							.. "Prefer this over a single broad goal.",
++					},
+ 					goal = {
+ 						type = "string",
+ 						description =
+-						"The child's only briefing besides NOTES. "
++						"Single goal if `goals` is omitted. "
+ 							.. "One action + one target, narrower than the current Goal. "
+ 							.. "Include every path, name, and constraint. "
+-							.. "Say what fact to return (name, path, yes/no). "
+-							.. "Do not ask the child to return code or dumps.",
++							.. "Say what fact to return (name, path, yes/no).",
++					},
++					role = {
++						type = "string",
++						description =
++						"orchestrator, coder, or validator. "
++							.. "Use coder for work. Omit to infer from tools.",
+ 					},
+ 					tools = {
+ 						type = "array",
+@@ -103,8 +119,15 @@ M.defs = {
+ 						"Tools the child needs for its goal, not a copy of yours. "
+ 							.. "You may grant tools you cannot call. "
+ 							.. "Example: [\"shell\"] to grep, [\"read\"] to open a file. "
+-							.. "If the child still needs more than one shot, also pass \"subtask\". "
+-							.. "Omit for a coordinator (subtask+notes only).",
++							.. "Coder default is read/shell/notes. "
++							.. "Omit for an orchestrator (subtask+notes).",
++					},
++					step = {
++						type = "number",
++						description =
++						"1-based index into the caller's plan. "
++							.. "The child gets that item's goal, agent, and notes. "
++							.. "Prefer this after writing a plan.",
+ 					},
+ 					system_prompt = {
+ 						type = "string",
+@@ -116,6 +139,64 @@ M.defs = {
+ 			},
+ 		},
+ 	},
++	plan = {
++		type = "function",
++		["function"] = {
++			name = "plan",
++			description =
++			"Structured plan tree for your branch. Each item has agent (coder or orchestrator), "
++				.. "status, goal, notes, and optional children. Write replaces your branch. "
++				.. "Update can use index 2 or path 1.2. The top orchestrator can edit any node. "
++				.. "A branch orchestrator can edit only its children. Dispatch with subtask step=N.",
++			parameters = {
++				type = "object",
++				properties = {
++					action = {
++						type = "string",
++						description = "write (replace this branch), update (one item), status",
++						enum = { "write", "update", "status" },
++					},
++					items = {
++						type = "array",
++						description = "Branch items for write. Each: agent, goal, notes, children.",
++						items = {
++							type = "object",
++							properties = {
++								agent = { type = "string", description = "coder or orchestrator" },
++								goal = { type = "string" },
++								notes = { type = "string" },
++								status = { type = "string" },
++								tools = {
++									type = "array",
++									items = { type = "string" },
++									description = "Tools for a coder item, e.g. read, shell, edit",
++								},
++								children = {
++									type = "array",
++									items = { type = "object" },
++									description = "Nested plan items",
++								},
++							},
++						},
++					},
++					index = {
++						type = "string",
++						description = "Item to update: 2 or 1.2 (relative to this branch)",
++					},
++					path = {
++						type = "string",
++						description = "Same as index (dotted path, relative to this branch)",
++					},
++					agent = { type = "string" },
++					goal = { type = "string" },
++					notes = { type = "string" },
++					status = { type = "string" },
++				},
++				additionalProperties = false,
++				required = { "action" },
++			},
++		},
++	},
+ 	send_image = {
+ 		type = "function",
+ 		["function"] = {
+diff --git a/lua/tai/tools/changes.lua b/lua/tai/tools/changes.lua
+new file mode 100644
+index 0000000..fdf5f85
+--- /dev/null
++++ b/lua/tai/tools/changes.lua
+@@ -0,0 +1,194 @@
++local M = {}
++
++M.MAX_CHANGES = 6000
++
++local function trim(s)
++	if type(s) ~= "string" then
++		return ""
++	end
++	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
++end
++
++local function shellescape(s)
++	if vim and vim.fn and vim.fn.shellescape then
++		return vim.fn.shellescape(s)
++	end
++	return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
++end
++
++local function run(cmd)
++	local h = io.popen(cmd, "r")
++	if not h then
++		return ""
++	end
++	local out = h:read("*a") or ""
++	h:close()
++	return out
++end
++
++function M.snapshot(root)
++	local set = {}
++	if type(root) ~= "string" or root == "" then
++		return set
++	end
++	local out = run("git -C " .. shellescape(root) .. " status --porcelain -uall 2&gt;/dev/null")
++	for line in (out .. "\n"):gmatch("(.-)\n") do
++		local path = line:match("^..%s+(.*)$")
++		if path then
++			path = path:gsub('^"', ""):gsub('"$', "")
++			local renamed = path:match("%s%-&gt;%s(.+)$")
++			set[renamed or path] = true
++		end
++	end
++	return set
++end
++
++local function unified(file, old, new)
++	old = old or ""
++	new = new or ""
++	local a = {}
++	local b = {}
++	if old ~= "" then
++		for line in (old .. "\n"):gmatch("(.-)\n") do
++			table.insert(a, line)
++		end
++	end
++	if new ~= "" then
++		for line in (new .. "\n"):gmatch("(.-)\n") do
++			table.insert(b, line)
++		end
++	end
++	local lines = { "--- a/" .. file, "+++ b/" .. file, "@@" }
++	for _, line in ipairs(a) do
++		table.insert(lines, "-" .. line)
++	end
++	for _, line in ipairs(b) do
++		table.insert(lines, "+" .. line)
++	end
++	return table.concat(lines, "\n")
++end
++
++function M.record_command(frame, command, failed)
++	if not frame or type(command) ~= "string" or command == "" then
++		return
++	end
++	frame.commands = frame.commands or {}
++	table.insert(frame.commands, {
++		command = command,
++		failed = failed == true,
++	})
++end
++
++function M.render_commands(frame)
++	local cmds = (frame and frame.commands) or {}
++	if #cmds == 0 then
++		return ""
++	end
++	local lines = {}
++	for _, c in ipairs(cmds) do
++		local line = "- " .. c.command
++		if c.failed then
++			line = line .. " [failed]"
++		end
++		table.insert(lines, line)
++	end
++	return table.concat(lines, "\n")
++end
++
++function M.record_edit(frame, file, old, new)
++	if not frame or type(file) ~= "string" or file == "" then
++		return
++	end
++	frame.file_changes = frame.file_changes or {}
++	frame.changed_set = frame.changed_set or {}
++	frame.changed_set[file] = true
++	table.insert(frame.file_changes, {
++		file = file,
++		kind = "edit",
++		diff = unified(file, old, new),
++	})
++end
++
++function M.record_write(frame, file, content)
++	if not frame or type(file) ~= "string" or file == "" then
++		return
++	end
++	frame.file_changes = frame.file_changes or {}
++	frame.changed_set = frame.changed_set or {}
++	frame.changed_set[file] = true
++	local body = content or ""
++	local shown = body
++	if #shown &gt; 2000 then
++		shown = shown:sub(1, 2000) .. "\n[truncated]"
++	end
++	table.insert(frame.file_changes, {
++		file = file,
++		kind = "write",
++		diff = unified(file, "", shown),
++	})
++end
++
++local function git_diff(root, file)
++	local diff = run("git -C " .. shellescape(root) .. " diff -- " .. shellescape(file) .. " 2&gt;/dev/null")
++	diff = trim(diff)
++	if diff ~= "" then
++		return diff
++	end
++	local path = root .. "/" .. file
++	local f = io.open(path, "r")
++	if not f then
++		return ""
++	end
++	local content = f:read("*a") or ""
++	f:close()
++	if #content &gt; 2000 then
++		content = content:sub(1, 2000) .. "\n[truncated]"
++	end
++	return unified(file, "", content)
++end
++
++--- Files dirtied after this worker started, excluding ones already recorded
++--- via edit/write (those keep the tool patch, not a full working-tree diff).
++function M.collect_shell(frame, root)
++	if not frame or type(root) ~= "string" or root == "" then
++		return
++	end
++	local now = M.snapshot(root)
++	local before = frame.git_dirty or {}
++	local seen = frame.changed_set or {}
++	frame.file_changes = frame.file_changes or {}
++	frame.changed_set = seen
++	for file, _ in pairs(now) do
++		if not before[file] and not seen[file] then
++			local diff = git_diff(root, file)
++			if diff ~= "" then
++				seen[file] = true
++				table.insert(frame.file_changes, {
++					file = file,
++					kind = "shell",
++					diff = diff,
++				})
++			end
++		end
++	end
++end
++
++function M.render(frame, max_chars)
++	max_chars = max_chars or M.MAX_CHANGES
++	local parts = {}
++	for _, ch in ipairs((frame and frame.file_changes) or {}) do
++		if ch.diff and ch.diff ~= "" then
++			table.insert(parts, ch.diff)
++		end
++	end
++	if #parts == 0 then
++		return ""
++	end
++	local text = table.concat(parts, "\n\n")
++	if #text &gt; max_chars then
++		text = text:sub(1, max_chars) .. "\n[changes truncated]"
++	end
++	return text
++end
++
++return M
+diff --git a/lua/tai/tools/plan.lua b/lua/tai/tools/plan.lua
+new file mode 100644
+index 0000000..4f4ca02
+--- /dev/null
++++ b/lua/tai/tools/plan.lua
+@@ -0,0 +1,394 @@
++local M = {}
++
++local STATUSES = {
++	pending = true,
++	running = true,
++	ok = true,
++	blocked = true,
++	error = true,
++	skipped = true,
++}
++
++local function trim(s)
++	if s == nil or s == vim.NIL then
++		return ""
++	end
++	if type(s) ~= "string" then
++		s = tostring(s)
++	end
++	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
++end
++
++function M.parse_index(index)
++	if type(index) == "number" then
++		if index &lt; 1 then
++			return nil
++		end
++		return { index }
++	end
++	if type(index) ~= "string" then
++		return nil
++	end
++	local path = {}
++	for part in index:gmatch("[^%.]+") do
++		local n = tonumber(part)
++		if not n or n &lt; 1 then
++			return nil
++		end
++		table.insert(path, n)
++	end
++	if #path == 0 then
++		return nil
++	end
++	return path
++end
++
++function M.normalize_item(raw)
++	if type(raw) == "string" then
++		raw = { goal = raw }
++	end
++	if type(raw) ~= "table" then
++		return nil
++	end
++	local goal = trim(raw.goal or raw.text or "")
++	if goal == "" then
++		return nil
++	end
++	local agent = trim(raw.agent or raw.role or "coder"):lower()
++	if agent == "manager" then
++		agent = "orchestrator"
++	end
++	if agent ~= "coder" and agent ~= "orchestrator" then
++		agent = "coder"
++	end
++	local status = trim(raw.status or "pending"):lower()
++	if not STATUSES[status] then
++		status = "pending"
++	end
++	local tools = {}
++	if type(raw.tools) == "table" then
++		for _, name in ipairs(raw.tools) do
++			if type(name) == "string" and name ~= "" then
++				table.insert(tools, name)
++			end
++		end
++	end
++	return {
++		agent = agent,
++		status = status,
++		goal = goal,
++		notes = type(raw.notes) == "string" and raw.notes or "",
++		result = type(raw.result) == "string" and raw.result or nil,
++		tools = tools,
++		children = M.sanitize(raw.children or raw.items),
++	}
++end
++
++function M.sanitize(items)
++	local out = {}
++	if type(items) ~= "table" then
++		return out
++	end
++	for _, raw in ipairs(items) do
++		local item = M.normalize_item(raw)
++		if item then
++			table.insert(out, item)
++		end
++	end
++	return out
++end
++
++function M.node_at(list, path)
++	if type(list) ~= "table" or type(path) ~= "table" or #path == 0 then
++		return nil
++	end
++	local cur = list
++	local node
++	for i, idx in ipairs(path) do
++		node = cur[idx]
++		if not node then
++			return nil
++		end
++		if i &lt; #path then
++			if type(node.children) ~= "table" then
++				node.children = {}
++			end
++			cur = node.children
++		end
++	end
++	return node
++end
++
++function M.visible(frame)
++	if not frame then
++		return {}
++	end
++	local root = frame.plan_root or frame.plan
++	if type(root) ~= "table" then
++		return {}
++	end
++	local path = frame.plan_path or {}
++	if #path == 0 then
++		return root
++	end
++	local node = M.node_at(root, path)
++	if not node then
++		return {}
++	end
++	if type(node.children) ~= "table" then
++		node.children = {}
++	end
++	return node.children
++end
++
++function M.get(frame)
++	return M.visible(frame)
++end
++
++local function replace_list(dest, items)
++	if type(dest) ~= "table" then
++		return items
++	end
++	for i = #dest, 1, -1 do
++		dest[i] = nil
++	end
++	for _, item in ipairs(items) do
++		table.insert(dest, item)
++	end
++	return dest
++end
++
++function M.set(frame, items)
++	if not frame then
++		return {}
++	end
++	local list = M.sanitize(items)
++	local dest = M.visible(frame)
++	if dest == (frame.plan_root or frame.plan) or (frame.plan_path and #frame.plan_path &gt; 0) then
++		return replace_list(dest, list)
++	end
++	frame.plan = list
++	frame.plan_root = list
++	frame.plan_path = frame.plan_path or {}
++	return frame.plan
++end
++
++function M.update(frame, index, fields)
++	local vis = M.visible(frame)
++	local path = M.parse_index(index)
++	if not path then
++		return nil, "plan item " .. tostring(index) .. " not found"
++	end
++	local cur = M.node_at(vis, path)
++	if not cur then
++		return nil, "plan item " .. tostring(index) .. " not found"
++	end
++	fields = fields or {}
++	local merged = {
++		agent = fields.agent or fields.role or cur.agent,
++		status = fields.status or cur.status,
++		goal = fields.goal or fields.text or cur.goal,
++		notes = fields.notes ~= nil and fields.notes or cur.notes,
++		result = fields.result ~= nil and fields.result or cur.result,
++		tools = fields.tools or cur.tools,
++		children = fields.children or fields.items or cur.children,
++	}
++	local item = M.normalize_item(merged)
++	if not item then
++		return nil, "plan item needs a goal"
++	end
++	local parent_list = vis
++	if #path &gt; 1 then
++		local parent = {}
++		for i = 1, #path - 1 do
++			parent[i] = path[i]
++		end
++		local parent_node = M.node_at(vis, parent)
++		parent_list = parent_node and parent_node.children or vis
++	end
++	parent_list[path[#path]] = item
++	return item
++end
++
++function M.mark(frame, index, status, result)
++	local vis = M.visible(frame)
++	local path = M.parse_index(index)
++	if not path then
++		return nil
++	end
++	local node = M.node_at(vis, path)
++	if not node then
++		return nil
++	end
++	if STATUSES[status] then
++		node.status = status
++	end
++	if type(result) == "string" then
++		if #result &gt; 600 then
++			result = result:sub(1, 600) .. "\n[truncated]"
++		end
++		node.result = result
++	end
++	return node
++end
++
++function M.item(frame, index)
++	local vis = M.visible(frame)
++	local path = M.parse_index(index)
++	if not path then
++		return nil
++	end
++	return M.node_at(vis, path)
++end
++
++function M.next_pending(frame)
++	local vis = M.visible(frame)
++	for i, item in ipairs(vis) do
++		if item.status == "pending" then
++			return i, item
++		end
++	end
++	return nil
++end
++
++function M.child_path(frame, step)
++	local path = {}
++	for _, p in ipairs((frame and frame.plan_path) or {}) do
++		table.insert(path, p)
++	end
++	step = tonumber(step)
++	if step then
++		table.insert(path, step)
++	end
++	return path
++end
++
++function M.render_task_notes(notes)
++	notes = trim(notes)
++	if notes == "" then
++		return ""
++	end
++	return table.concat({
++		"========== TASK NOTES ==========",
++		"",
++		notes,
++		"",
++		"========== END TASK NOTES ==========",
++	}, "\n")
++end
++
++local function item_tools(item)
++	if item.agent == "orchestrator" then
++		return "orchestrator - subtask notes plan"
++	end
++	local tools = item.tools
++	if type(tools) ~= "table" or #tools == 0 then
++		tools = { "read", "shell", "edit" }
++	end
++	return "coder - " .. table.concat(tools, " ")
++end
++
++local function render_list(list, prefix, depth, lines)
++	if type(list) ~= "table" then
++		return lines
++	end
++	local pad = string.rep("   ", depth)
++	for i, item in ipairs(list) do
++		local label = prefix == "" and tostring(i) or (prefix .. "." .. i)
++		table.insert(lines, pad .. label .. ". " .. (item.goal or ""))
++		if item.notes and item.notes ~= "" then
++			local first = true
++			for line in (item.notes .. "\n"):gmatch("(.-)\n") do
++				if first then
++					table.insert(lines, pad .. "   Notes: " .. line)
++					first = false
++				else
++					table.insert(lines, pad .. "          " .. line)
++				end
++			end
++		end
++		local tag = "[" .. string.upper(item.status or "pending") .. "]"
++		table.insert(lines, pad .. "   " .. tag .. " (" .. item_tools(item) .. ")")
++		if item.result and item.result ~= "" then
++			local first = item.result:match("^[^\n]+") or item.result
++			table.insert(lines, pad .. "   Result: " .. first)
++		end
++		table.insert(lines, "")
++		if item.children and #item.children &gt; 0 then
++			render_list(item.children, label, depth + 1, lines)
++		end
++	end
++	return lines
++end
++
++function M.render(plan)
++	if type(plan) ~= "table" or #plan == 0 then
++		return ""
++	end
++	local lines = render_list(plan, "", 0, {})
++	while lines[#lines] == "" do
++		lines[#lines] = nil
++	end
++	return table.concat(lines, "\n")
++end
++
++function M.render_for(frame)
++	if not frame or frame.role ~= "orchestrator" then
++		return ""
++	end
++	local vis = M.visible(frame)
++	local lines = {}
++	local path = frame.plan_path or {}
++	if #path &gt; 0 then
++		local node = M.node_at(frame.plan_root or frame.plan, path)
++		if node then
++			table.insert(lines, "branch: " .. table.concat(path, ".") .. " " .. (node.status or "") .. " " .. (node.agent or ""))
++			table.insert(lines, "goal: " .. (node.goal or ""))
++			if node.notes and node.notes ~= "" then
++				table.insert(lines, "notes: " .. node.notes)
++			end
++		end
++	end
++	local body = M.render(vis)
++	if body ~= "" then
++		if #lines &gt; 0 then
++			table.insert(lines, "")
++		end
++		table.insert(lines, body)
++	end
++	if #lines == 0 then
++		return ""
++	end
++	return table.concat(lines, "\n")
++end
++
++function M.run(args, frame)
++	args = args or {}
++	frame = frame or {}
++	local action = args.action
++	if action == "write" then
++		local plan = M.set(frame, args.items)
++		if #plan == 0 then
++			return "Error: plan write needs items with a goal"
++		end
++		return string.format("Plan written (%d steps).", #plan)
++	elseif action == "update" then
++		local item, err = M.update(frame, args.path or args.index, args)
++		if not item then
++			return "Error: " .. (err or "update failed")
++		end
++		return string.format("Plan item %s updated (%s %s).", tostring(args.path or args.index), item.status, item.agent)
++	elseif action == "status" then
++		local text = M.render_for(frame)
++		if text == "" then
++			text = M.render(M.visible(frame))
++		end
++		if text == "" then
++			return "No plan."
++		end
++		return text
++	end
++	return "Error: unknown action '" .. tostring(action) .. "'"
++end
++
++return M
+diff --git a/lua/tai/tools/subtask.lua b/lua/tai/tools/subtask.lua
+index afa12dd..fccbeae 100644
+--- a/lua/tai/tools/subtask.lua
++++ b/lua/tai/tools/subtask.lua
+@@ -57,6 +57,10 @@ local function is_weak_reply(s)
+ 	if s == "" then
+ 		return true
+ 	end
++	local lower = s:lower():gsub("%s+$", "")
++	if lower == "handoff" or lower == "handoff." then
++		return true
++	end
+ 	if s:match("^I'll ") or s:match("^I will ") or s:match("^Let me ")
+ 		or s:match("^Looking ") or s:match("^I am going") then
+ 		return true
+@@ -64,6 +68,10 @@ local function is_weak_reply(s)
+ 	return false
+ end
+ 
++function M.is_weak_reply(s)
++	return is_weak_reply(trim_text(s))
++end
++
+ function M.outcome_for(frame, assistant_text)
+ 	local assistant = trim_text(assistant_text)
+ 	local parts = (frame and frame.tool_outputs) or {}
+@@ -106,7 +114,8 @@ function M.format_progress(frame)
+ 	end
+ 	for i = start, #steps do
+ 		local step = steps[i]
+-		table.insert(lines, string.format("%d. %s", i, step.text or ""))
++		local tag = step.status == "blocked" and " [blocked]" or ""
++		table.insert(lines, string.format("%d. %s%s", i, step.text or "", tag))
+ 		local resp = step.response
+ 		if type(resp) == "string" and resp ~= "" then
+ 			resp = M.cap_report(resp, 600)
+@@ -115,9 +124,143 @@ function M.format_progress(frame)
+ 			end
+ 		end
+ 	end
++	if frame.role == "orchestrator" then
++		table.insert(lines, "")
++		local last = steps[#steps]
++		if last and last.status == "blocked" then
++			table.insert(lines, "Last step was blocked. Update later plan items. Do not repeat that step.")
++		else
++			table.insert(lines, "Last step was validated. Copy useful discoveries into notes. Update later plan items (goal, notes, agent) if needed, then dispatch the next step or answer.")
++		end
++	end
+ 	return table.concat(lines, "\n")
+ end
+ 
++function M.validator_brief(goal, outcome, changes_text, commands_text)
++	local parts = {
++		"Goal:",
++		tostring(goal or ""),
++		"",
++		"Result:",
++		tostring(outcome or "(no output)"),
++	}
++	if type(commands_text) == "string" and commands_text ~= "" then
++		table.insert(parts, "")
++		table.insert(parts, "Tools (this agent only, no output):")
++		table.insert(parts, commands_text)
++	end
++	if type(changes_text) == "string" and changes_text ~= "" then
++		table.insert(parts, "")
++		table.insert(parts, "Changes (this agent only):")
++		table.insert(parts, changes_text)
++	end
++	table.insert(parts, "")
++	table.insert(parts, "Did the Result complete this Goal? Reply exactly:")
++	table.insert(parts, "ok")
++	table.insert(parts, "missing: &lt;undone part of the Goal, in the Goal's words&gt;")
++	table.insert(parts, "blocked: &lt;a premise in the Goal is false&gt;")
++	table.insert(parts, "Do not invent a new task, command, or file.")
++	return table.concat(parts, "\n")
++end
++
++local function labeled_line(text, label)
++	local pos = text:lower():find(label .. ":", 1, true)
++	if not pos then
++		return nil
++	end
++	local rest = text:sub(pos + #label + 1)
++	rest = rest:match("^[^\n]+") or rest
++	rest = rest:match("^%s*(.-)%s*$") or rest
++	if rest == "" then
++		return nil
++	end
++	return rest
++end
++
++function M.parse_verdict(text)
++	text = trim_text(text)
++	if text == "" then
++		return "missing", "empty validator reply"
++	end
++	local first = text:match("^[^\n]+") or text
++	first = first:match("^%s*(.-)%s*$") or first
++	local lower = first:lower()
++	if lower == "ok" or lower == "ok." or lower:match("^status:%s*ok") then
++		return "ok"
++	end
++	local blocked = labeled_line(text, "blocked")
++	if blocked then
++		return "blocked", blocked
++	end
++	if lower == "blocked" or lower:match("^blocked%s") then
++		return "blocked", first
++	end
++	local missing = labeled_line(text, "missing")
++	if missing then
++		return "missing", missing
++	end
++	return "missing", first
++end
++
++local STOP = {
++	that = true, this = true, with = true, from = true, into = true,
++	have = true, been = true, will = true, they = true, them = true,
++	["then"] = true, than = true, when = true, what = true, your = true,
++	their = true, about = true, which = true, where = true, there = true,
++}
++
++local function content_words(s)
++	local out = {}
++	for w in tostring(s or ""):lower():gmatch("[%w_./-]+") do
++		if #w &gt;= 4 and not STOP[w] then
++			out[w] = true
++		end
++	end
++	return out
++end
++
++--- True when `text` still talks about the Goal, not a new job.
++function M.same_scope(goal, text)
++	if type(text) ~= "string" or text == "" then
++		return false
++	end
++	local g = content_words(goal)
++	local t = content_words(text)
++	local tn, hit = 0, 0
++	for w in pairs(t) do
++		tn = tn + 1
++		if g[w] then
++			hit = hit + 1
++		end
++	end
++	if tn == 0 then
++		return false
++	end
++	-- missing must mostly reuse the Goal's words, not add a new job.
++	return hit &gt;= math.max(1, math.ceil(tn * 0.5))
++end
++
++function M.apply_missing(frame, detail)
++	if not frame then
++		return
++	end
++	local goal = frame.original_goal or frame.goal
++	frame.original_goal = goal
++	frame.goal = goal
++	if type(detail) ~= "string" or detail == "" then
++		return
++	end
++	if not M.same_scope(goal, detail) then
++		return
++	end
++	local extra = "Still undone from the Goal (do this part only, do not change the Goal): " .. detail
++	if frame.task_notes and frame.task_notes ~= "" then
++		frame.task_notes = frame.task_notes .. "\n" .. extra
++	else
++		frame.task_notes = extra
++	end
++end
++
+ -- Shared notepad for the whole stack (main + every worker).
+ local notes_text = ""
+ 
+@@ -197,6 +340,13 @@ end
+ function M.format_complete(status, summary, frame)
+ 	local outcome = summary or M.outcome_for(frame, nil)
+ 	local step = frame and frame.goal or "?"
++	if status == "blocked" then
++		return table.concat({
++			"status: blocked",
++			"step: " .. step,
++			"blocked: " .. outcome,
++		}, "\n")
++	end
+ 	if status == "error" or is_error_text(outcome) then
+ 		return table.concat({
+ 			"status: error",
+diff --git a/lua/tai/ui/core.lua b/lua/tai/ui/core.lua
+index 6f0fbf9..58330d2 100644
+--- a/lua/tai/ui/core.lua
++++ b/lua/tai/ui/core.lua
+@@ -8,6 +8,8 @@ local tools_io = require("tai.tools.io")
+ local tools_shell = require("tai.tools.shell")
+ local tools_edit = require("tai.tools.edit")
+ local tools_subtask = require("tai.tools.subtask")
++local tools_plan = require("tai.tools.plan")
++local tools_changes = require("tai.tools.changes")
+ local tools_skill = require("tai.tools.skill")
+ local tools_mcp = require("tai.tools.mcp")
+ local nest = require("tai.ui.nest")
+@@ -54,6 +56,9 @@ local function nest_label(frame)
+ 	if d &lt; 1 then
+ 		return "MAIN"
+ 	end
++	if frame and frame.label and frame.label ~= "SUBTASK" then
++		return frame.label
++	end
+ 	return string.format("SUBTASK %d", d)
+ end
+ 
+@@ -62,8 +67,12 @@ end
+ _G.TaiChatFoldText = function()
+ 	local line = vim.fn.getline(vim.v.foldstart)
+ 	local indent = (line:match("^(%s*)") or ""):gsub(" ", "\194\160")
+-	local n = vim.v.foldend - vim.v.foldstart + 1
+-	return indent .. "{{{ " .. tostring(n) .. " lines }}}"
++	local inner = line:match("%{%{%{%s*(.*)$") or ""
++	inner = inner:gsub("%s+$", "")
++	if inner == "" then
++		inner = tostring(vim.v.foldend - vim.v.foldstart + 1) .. " lines"
++	end
++	return indent .. "{{{ " .. inner .. " }}}"
+ end
+ 
+ local function apply_fold_settings(win)
+@@ -113,16 +122,6 @@ local function refresh_and_close_folds()
+ 	end)
+ end
+ 
+-local function append_output(label, body, depth)
+-	if label and label ~= "" then
+-		M.append(label .. "\n", depth)
+-	end
+-	if body and body ~= "" then
+-		M.append("{{{\n" .. body .. "\n}}}\n", depth)
+-		refresh_and_close_folds()
+-	end
+-end
+-
+ -- Keep {{{ / }}} inside old/new text from closing the chat fold early.
+ local function fold_safe(s)
+ 	if type(s) ~= "string" or s == "" then
+@@ -131,6 +130,36 @@ local function fold_safe(s)
+ 	return (s:gsub("}}}", "} } }"):gsub("{{{", "{ { {"))
+ end
+ 
++local function mark_last_fold_failed()
++	if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
++		return
++	end
++	local lines = vim.api.nvim_buf_get_lines(M.buffer_nr, 0, -1, false)
++	for i = #lines, 1, -1 do
++		if lines[i]:find("{{{", 1, true) then
++			if not lines[i]:find("%[failed%]") then
++				local updated = lines[i]:gsub("%s*$", "") .. " [failed]"
++				vim.api.nvim_buf_set_lines(M.buffer_nr, i - 1, i, false, { updated })
++			end
++			return
++		end
++	end
++end
++
++local function append_output(label, body, depth, failed)
++	if failed and label and label ~= "" and not label:find("%[failed%]") then
++		label = label .. " [failed]"
++	end
++	local head = (label and label ~= "") and ("{{{ " .. label) or "{{{"
++	local text = head .. "\n"
++	if body and body ~= "" then
++		text = text .. fold_safe(body) .. "\n"
++	end
++	text = text .. "}}}\n"
++	M.append(text, depth)
++	refresh_and_close_folds()
++end
++
+ local function format_edit_fold(old_text, new_text, result)
+ 	local parts = {
+ 		"old:",
+@@ -156,10 +185,16 @@ local function worker_history(frame)
+ end
+ 
+ local function prepare_messages(frame)
+-	-- Isolated workers always start from scratch: system + goal only.
+-	local msgs = frame.isolated and worker_history(frame) or vim.deepcopy(frame.history)
++	-- Isolated coordinators start from scratch: system + goal only.
++	-- Coders keep tool history so they can take more than one turn.
++	local msgs
++	if frame.isolated and not agent.iterates(frame) then
++		msgs = worker_history(frame)
++	else
++		msgs = vim.deepcopy(frame.history)
++	end
+ 	if msgs[1] and msgs[1].role == "system" then
+-		local parts = { frame.system_prompt }
++		local parts = { agent.prompt_for(frame.role, frame.phase) }
+ 		local tool_section = agent.render_tools(frame.tools)
+ 		if tool_section ~= "" then
+ 			table.insert(parts, tool_section)
+@@ -168,6 +203,27 @@ local function prepare_messages(frame)
+ 		if notes ~= "" then
+ 			table.insert(parts, notes)
+ 		end
++		local task_notes = tools_plan.render_task_notes(frame.task_notes)
++		if task_notes ~= "" then
++			table.insert(parts, task_notes)
++		end
++		local plan_section = tools_plan.render_for(frame)
++		if plan_section ~= "" then
++			table.insert(parts, plan_section)
++		end
++		if frame.role == "orchestrator" then
++			if frame.phase == "decompose" then
++				table.insert(parts, "Here is the goal. Analyse it and answer if you should split it into smaller tasks.\n"
++					.. "Write a plan of children, or say this is a leaf.")
++			elseif frame.phase == "revise" then
++				table.insert(parts, "Last task: " .. tostring(frame.last_child_goal or "")
++					.. "\n\nOutput:\n" .. tostring(frame.last_child_report or "(no output)")
++					.. "\n\nHere is the plan. Analyse it and answer if you need to update later items."
++					.. " Copy useful discoveries from the output into notes.")
++			elseif frame.phase == "handoff" then
++				table.insert(parts, "Nothing is pending. Reply with the result of your goal. Include short discoveries from the reports.")
++			end
++		end
+ 		if frame.isolated then
+ 			local live = tools_subtask.render_memory(frame)
+ 			if live ~= "" then
+@@ -301,6 +357,14 @@ function M.init()
+ 	vim.bo[M.buffer_nr].modifiable = true
+ 	vim.bo[M.buffer_nr].filetype = "text"
+ 
++    -- Load session history
++    local chat_lines = context.load()
++    if chat_lines and #chat_lines &gt; 0 then
++      vim.api.nvim_buf_set_lines(M.buffer_nr, -1, -1, false, chat_lines)
++    else
++      print("[DEBUG] No chat_lines to append or chat_lines is empty")
++    end
++
+ 	if not config.stream then
+ 		vim.keymap.set("i", "}", function()
+ 			if vim.wo.foldmethod ~= "marker" then
+@@ -441,7 +505,7 @@ local function run_live_shell(command, on_done, depth)
+ 	local finished = false
+ 	local stop_timer = nil
+ 
+-	local function finish(out)
++	local function finish(out, code)
+ 		if finished then
+ 			return
+ 		end
+@@ -455,7 +519,7 @@ local function run_live_shell(command, on_done, depth)
+ 			stop_timer = nil
+ 		end
+ 		vim.schedule(function()
+-			on_done(out)
++			on_done(out, code or 0)
+ 		end)
+ 	end
+ 
+@@ -485,7 +549,7 @@ local function run_live_shell(command, on_done, depth)
+ 			if (code or 0) ~= 0 then
+ 				full = full .. "\n[exit " .. tostring(code or 0) .. "]"
+ 			end
+-			finish(full)
++			finish(full, code)
+ 		end,
+ 		stdout_buffered = false,
+ 		stderr_buffered = false,
+@@ -500,7 +564,7 @@ local function run_live_shell(command, on_done, depth)
+ 
+ 	current_job = job
+ 	if job &lt;= 0 then
+-		finish("Failed to start: " .. command)
++		finish("Failed to start: " .. command, 1)
+ 		return
+ 	end
+ 
+@@ -538,22 +602,21 @@ local function record_tool_output(frame, content)
+ 	table.insert(frame.tool_outputs, text)
+ end
+ 
+--- Worker is done: print reply at this indent, then pop and resume parent.
+-local function finish_oneshot(frame, assistant_text, status)
+-	if not frame or #stack &lt;= 1 then
+-		return false
+-	end
+-	if not status then
+-		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
+-			status = "error"
+-		else
+-			status = "ok"
+-		end
+-	end
+-	local outcome = tools_subtask.outcome_for(frame, assistant_text)
+-	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
+-		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
+-	end
++local function reset_worker(frame, goal)
++	frame.goal = goal
++	frame.tool_outputs = {}
++	frame.last_assistant = nil
++	frame.last_outcome = nil
++	frame._printed_content = nil
++	frame.continue_after_tools = false
++	frame.turns = 0
++	frame.last_tool_ok = nil
++	frame.history = worker_history(frame)
++end
++
++local print_plan
++
++local function return_to_parent(frame, status, outcome)
+ 	local close_depth = nest_depth(frame)
+ 	if close_depth &gt; 0 then
+ 		close_depth = close_depth - 1
+@@ -566,11 +629,24 @@ local function finish_oneshot(frame, assistant_text, status)
+ 	local parent = top()
+ 	if parent then
+ 		parent.steps = parent.steps or {}
++		local label = frame.goal or ""
++		if type(frame.goals) == "table" and #frame.goals &gt; 1 then
++			label = table.concat(frame.goals, "; ")
++		end
+ 		table.insert(parent.steps, {
+-			text = frame.goal or "",
++			text = label,
+ 			response = report,
+ 			status = status,
+ 		})
++		if frame.plan_step then
++			tools_plan.mark(parent, frame.plan_step, status, outcome)
++		end
++		if parent.role == "orchestrator" then
++			parent.phase = "revise"
++			parent.last_child_report = report
++			parent.last_child_goal = frame.goal
++			parent._needs_revise = true
++		end
+ 	end
+ 	M.update_chat_name()
+ 	update_input_name()
+@@ -581,7 +657,6 @@ local function finish_oneshot(frame, assistant_text, status)
+ 		resume(report)
+ 		return true
+ 	end
+-	-- Main keeps tool results in chat history. Isolated parents stay at goal-only.
+ 	if parent and frame.parent_call_id and not parent.isolated then
+ 		table.insert(parent.history, {
+ 			role = "tool",
+@@ -593,6 +668,264 @@ local function finish_oneshot(frame, assistant_text, status)
+ 	return true
+ end
+ 
++local function queue_report(frame)
++	local parts = {}
++	for i, r in ipairs(frame.goal_reports or {}) do
++		table.insert(parts, i .. ". " .. tostring(r.text or "") .. "\n" .. tostring(r.response or ""))
++	end
++	if #parts == 0 then
++		return frame.last_outcome or "(no output)"
++	end
++	return table.concat(parts, "\n\n")
++end
++
++local spawn_validator
++local after_goal_ok
++local finish_validator
++local after_orchestrator_turn
++local start_plan_child
++
++local function append_child_header(parent, child, step)
++	local depth = nest_depth(parent)
++	local child_depth = #stack
++	local head = child.label or "SUBTASK"
++	local goal = child.goal or ""
++	if step then
++		M.append(string.format("%s %s [%s]\n", head, goal, tostring(step)), depth)
++	else
++		M.append(head .. " " .. goal .. "\n", depth)
++	end
++	if child.tools and #child.tools &gt; 0 then
++		M.append("tools: " .. table.concat(child.tools, ", ") .. "\n", child_depth)
++	end
++end
++
++print_plan = function(frame, why)
++	if not frame then
++		return
++	end
++	local body = tools_plan.render_for(frame)
++	if body == "" then
++		return
++	end
++	local title = "PLAN"
++	if why and why ~= "" then
++		title = "PLAN " .. why
++	end
++	M.append(title .. "\n" .. body .. "\n", nest_depth(frame))
++end
++
++start_plan_child = function(parent, step, item, resume)
++	item = item or (step and tools_plan.item(parent, step))
++	if not item then
++		return false
++	end
++	local role = agent.parse_role(item.agent, { profile = "subtask", tools = item.tools })
++	local child = agent.new_frame({
++		profile = "subtask",
++		role = role,
++		tools = role == "orchestrator" and nil or item.tools,
++		goal = item.goal,
++		depth = #stack,
++		task_notes = item.notes or "",
++		plan_step = step,
++		plan_root = parent.plan_root or parent.plan,
++		plan_path = step and tools_plan.child_path(parent, step) or (parent.plan_path or {}),
++		phase = role == "orchestrator" and "decompose" or nil,
++	})
++	if step then
++		tools_plan.mark(parent, step, "running")
++	end
++	append_child_header(parent, child, step)
++	child.on_parent_resume = resume or function(report)
++		parent.phase = "revise"
++		parent.last_child_report = report
++		parent.last_child_goal = child.goal
++		M.continue()
++	end
++	table.insert(stack, child)
++	M.update_chat_name()
++	update_input_name()
++	maybe_auto_save()
++	M.continue()
++	return true
++end
++
++after_orchestrator_turn = function(frame, text)
++	local step, item = tools_plan.next_pending(frame)
++	if step then
++		frame.phase = "run"
++		return start_plan_child(frame, step, item)
++	end
++	if frame.phase == "decompose" then
++		frame.phase = "run"
++		local leaf = {
++			agent = "coder",
++			goal = frame.goal or tools_subtask.frame_goal(frame),
++			notes = frame.task_notes or "",
++			tools = vim.deepcopy(agent.coder_tools),
++			status = "pending",
++		}
++		return start_plan_child(frame, nil, leaf)
++	end
++	if is_worker() then
++		if text and not agent.weak_phase_reply(text) then
++			frame.phase = "handoff"
++			frame.last_outcome = text
++			return spawn_validator(frame, text)
++		end
++		frame.phase = "handoff"
++		M.continue()
++		return true
++	end
++	frame.phase = nil
++	current_state = "idle"
++	update_input_name()
++	maybe_auto_save()
++	return false
++end
++
++after_goal_ok = function(frame)
++	frame.goal_reports = frame.goal_reports or {}
++	table.insert(frame.goal_reports, {
++		text = frame.goal,
++		response = frame.last_outcome or "",
++	})
++	frame.steps = frame.steps or {}
++	table.insert(frame.steps, {
++		text = frame.goal,
++		response = frame.last_outcome or "",
++		status = "ok",
++	})
++	local idx = frame.goal_index or 1
++	local goals = frame.goals or { frame.goal }
++	if idx &lt; #goals then
++		frame.goal_index = idx + 1
++		frame.validate_retries = 0
++		local next_goal = goals[frame.goal_index]
++		local parent_depth = math.max(0, nest_depth(frame) - 1)
++		local n = #goals
++		M.append(string.format("%s %s (%d/%d)\n", frame.label or "CODER", next_goal, idx + 1, n), parent_depth)
++		if frame.tools and #frame.tools &gt; 0 then
++			M.append("tools: " .. table.concat(frame.tools, ", ") .. "\n", nest_depth(frame))
++		end
++		reset_worker(frame, next_goal)
++		M.update_chat_name()
++		maybe_auto_save()
++		M.continue()
++		return true
++	end
++	return return_to_parent(frame, "ok", queue_report(frame))
++end
++
++spawn_validator = function(subject, outcome)
++	if #stack &gt;= (agent.MAX_DEPTH or 8) then
++		return after_goal_ok(subject)
++	end
++	tools_changes.collect_shell(subject, config.root)
++	local child = agent.new_frame({
++		profile = "subtask",
++		role = "validator",
++		goal = tools_subtask.validator_brief(
++			subject.goal,
++			outcome,
++			tools_changes.render(subject),
++			tools_changes.render_commands(subject)
++		),
++		tools = {},
++		depth = #stack,
++		task_notes = subject.task_notes,
++	})
++	M.append("VALIDATOR\n", nest_depth(subject))
++	table.insert(stack, child)
++	M.update_chat_name()
++	update_input_name()
++	maybe_auto_save()
++	M.continue()
++	return true
++end
++
++finish_validator = function(vframe, assistant_text)
++	local text = assistant_text or ""
++	if not vframe._printed_content and type(text) == "string" and text ~= "" then
++		M.append("\n" .. text .. "\n", nest_depth(vframe))
++	end
++	if top() == vframe then
++		table.remove(stack)
++	end
++	local subject = top()
++	if not subject or subject.role == "validator" or #stack &lt;= 1 then
++		return false
++	end
++	local verdict, detail = tools_subtask.parse_verdict(text)
++	if verdict == "ok" then
++		return after_goal_ok(subject)
++	end
++	if verdict == "blocked" then
++		local why = detail or "blocked"
++		M.append("BLOCKED " .. why .. "\n", nest_depth(subject))
++		local outcome = subject.last_outcome or ""
++		if outcome ~= "" then
++			outcome = "blocked: " .. why .. "\n\n" .. outcome
++		else
++			outcome = "blocked: " .. why
++		end
++		return return_to_parent(subject, "blocked", outcome)
++	end
++	subject.validate_retries = (subject.validate_retries or 0) + 1
++	if subject.validate_retries &gt; (agent.MAX_VALIDATE_RETRIES or 2) then
++		M.append("validator retries exhausted\n", nest_depth(subject))
++		return after_goal_ok(subject)
++	end
++	local goal = subject.original_goal or subject.goal
++	if detail and tools_subtask.same_scope(goal, detail) then
++		tools_subtask.apply_missing(subject, detail)
++		M.append("RETRY " .. detail .. "\n", nest_depth(subject))
++	else
++		M.append("RETRY (stay on the Goal)\n", nest_depth(subject))
++	end
++	reset_worker(subject, goal)
++	M.update_chat_name()
++	maybe_auto_save()
++	M.continue()
++	return true
++end
++
++-- Worker is done: validate (unless this is the validator), then pop or retry.
++local function finish_oneshot(frame, assistant_text, status)
++	if not frame or #stack &lt;= 1 then
++		return false
++	end
++	if not status then
++		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
++			status = "error"
++		else
++			status = "ok"
++		end
++	end
++	if frame.role == "validator" then
++		return finish_validator(frame, assistant_text)
++	end
++	if frame.last_tool_ok == false and tools_subtask.is_weak_reply(assistant_text or "") then
++		M.append("tool failed; continuing\n", nest_depth(frame))
++		M.continue()
++		return true
++	end
++	if frame.role == "orchestrator"
++		and (frame.phase == "decompose" or frame.phase == "revise") then
++		return after_orchestrator_turn(frame, assistant_text)
++	end
++	local outcome = tools_subtask.outcome_for(frame, assistant_text)
++	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
++		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
++	end
++	if status == "error" then
++		return return_to_parent(frame, "error", outcome)
++	end
++	frame.last_outcome = outcome
++	return spawn_validator(frame, outcome)
++end
++
+ local function after_tool_round(frame, stop)
+ 	maybe_auto_save()
+ 	if hard_stop then
+@@ -604,12 +937,29 @@ local function after_tool_round(frame, stop)
+ 	if stop then
+ 		return
+ 	end
+-	-- Nested subtask sets continue_after_tools. Work tools end this worker.
+-	if is_worker() and not frame.continue_after_tools then
++	if frame._needs_revise then
++		frame._needs_revise = false
++		frame.phase = "revise"
++		M.continue()
++		return
++	end
++	if frame.role == "orchestrator"
++		and (frame.phase == "decompose" or frame.phase == "revise") then
++		after_orchestrator_turn(frame, frame.last_assistant)
++		return
++	end
++	-- A failed tool never ends a coder. They must see the error and retry.
++	if agent.iterates(frame) and frame.last_tool_ok == false then
++		M.continue()
++		return
++	end
++	-- Coordinators end on work tools. Coders keep going until they reply
++	-- with no tool call. Nested subtask / notes / plan set continue_after_tools.
++	if is_worker() and not frame.continue_after_tools and not agent.iterates(frame) then
+ 		finish_oneshot(frame, frame.last_assistant)
+ 		return
+ 	end
+-	if frame.isolated then
++	if frame.isolated and not agent.iterates(frame) then
+ 		frame.history = worker_history(frame)
+ 	end
+ 	M.continue()
+@@ -643,20 +993,6 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 	local depth = nest_depth(frame)
+ 	frame.continue_after_tools = false
+ 
+-	if type(tool_calls) == "table" and #tool_calls &gt; 1 then
+-		for i = 2, #tool_calls do
+-			local extra = tool_calls[i]
+-			local fn = extra["function"] or {}
+-			table.insert(history, {
+-				role = "tool",
+-				name = fn.name,
+-				tool_call_id = extra.id,
+-				content = "Only one tool call per turn. Ignored.",
+-			})
+-		end
+-		tool_calls = { tool_calls[1] }
+-	end
+-
+ 	if start_index == 1 then
+ 		M.append("\n", depth)
+ 	end
+@@ -694,14 +1030,24 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 			process_from(i + 1)
+ 		end
+ 
++		local function note_call(summary, failed)
++			if type(summary) == "string" and summary ~= "" then
++				tools_changes.record_command(frame, summary, failed)
++			end
++		end
++
++		frame.last_tool_ok = true
++
+ 		if not agent.tool_granted(frame.tools, name) then
+ 			local granted = table.concat(frame.tools or {}, ", ")
+ 			if granted == "" then
+ 				granted = "(none)"
+ 			end
+-			M.append("tool denied: " .. tostring(name) .. "\n", depth)
+ 			res.content = "Tool `" .. tostring(name) .. "` is not granted. Granted: "
+ 				.. granted .. ". Call subtask and pass the tool if a child needs it."
++			append_output("tool denied: " .. tostring(name), res.content, depth, true)
++			note_call(tostring(name), true)
++			frame.last_tool_ok = false
+ 			finish_one()
+ 			return
+ 		end
+@@ -709,16 +1055,24 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 		if name == "shell" then
+ 			local command = args.command
+ 			if type(command) ~= "string" or command == "" then
+-				M.append("shell: missing command\n", depth)
+ 				res.content = "missing command field"
++				append_output("shell: missing command", res.content, depth, true)
++				note_call("shell: missing command", true)
++				frame.last_tool_ok = false
+ 			else
+ 				local unsafe = tools_shell.unsafe_command(command)
+ 				if not unsafe or config.auto_approve then
+-					M.append("shell: " .. command .. "\n{{{\n", depth)
++					M.append("{{{ shell: " .. command .. "\n", depth)
+ 					current_state = "tools"
+ 					update_input_name()
+-					run_live_shell(command, function(out)
++					run_live_shell(command, function(out, code)
+ 						res.content = tools_io.limit_output(out, "shell")
++						local failed = (code or 0) ~= 0
++						tools_changes.record_command(frame, command, failed)
++						if failed then
++							frame.last_tool_ok = false
++							mark_last_fold_failed()
++						end
+ 						M.append((out or "") .. "\n}}}\n", depth)
+ 						refresh_and_close_folds()
+ 						finish_one()
+@@ -737,41 +1091,73 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 			end
+ 		elseif name == "read" then
+ 			if not args.file then
+-				M.append("read: missing file\n", depth)
+ 				res.content = "missing file field"
++				append_output("read: missing file", res.content, depth, true)
++				note_call("read: missing file", true)
++				frame.last_tool_ok = false
+ 			elseif vim.fn.filereadable(args.file) ~= 1 then
+-				M.append("read: " .. args.file .. " not readable\n", depth)
+ 				res.content = "file does not exist or is not readable"
++				append_output("read: " .. args.file, res.content, depth, true)
++				note_call("read: " .. args.file, true)
++				frame.last_tool_ok = false
+ 			else
+ 				local range_label = args.range and (" [" .. args.range .. "]") or ""
+ 				res.content = tools_io.read_file(args.file, args.range)
+ 				res.file_range = args.range
+-				append_output("read: " .. args.file .. range_label, res.content, depth)
++				local failed = type(res.content) == "string"
++					and (res.content:match("^Error") or res.content:match("^Paths cannot")
++						or res.content:match("^File `") or res.content:match("^Binary"))
++				if failed then
++					frame.last_tool_ok = false
++				end
++				note_call("read: " .. args.file .. range_label, failed)
++				append_output("read: " .. args.file .. range_label, res.content, depth, failed)
+ 			end
+ 		elseif name == "edit" then
+ 			if not args.file then
+-				M.append("edit: missing file\n", depth)
+ 				res.content = "missing file field"
++				append_output("edit: missing file", res.content, depth, true)
++				note_call("edit: missing file", true)
++				frame.last_tool_ok = false
+ 			else
+ 				local out = tools_edit.edit(args.file, args.old_text, args.new_text, args.multi, config)
+ 				res.content = out
++				local failed = type(out) == "string" and not out:match("^Patched")
++				if failed then
++					frame.last_tool_ok = false
++				else
++					tools_changes.record_edit(frame, args.file, args.old_text, args.new_text)
++				end
++				note_call("edit: " .. args.file, failed)
+ 				append_output(
+ 					"edit: " .. args.file,
+ 					format_edit_fold(args.old_text, args.new_text, out),
+-					depth
++					depth,
++					failed
+ 				)
+ 			end
+ 		elseif name == "write" then
+ 			if not args.file then
+-				M.append("write: missing file\n", depth)
+ 				res.content = "missing file field"
++				append_output("write: missing file", res.content, depth, true)
++				note_call("write: missing file", true)
++				frame.last_tool_ok = false
+ 			elseif not args.content then
+-				M.append("write: missing content\n", depth)
+ 				res.content = "missing content field"
++				append_output("write: " .. args.file, res.content, depth, true)
++				note_call("write: " .. args.file, true)
++				frame.last_tool_ok = false
+ 			else
+ 				local out = tools_subtask.write(args.file, args.content)
+ 				res.content = out
+-				append_output("write: " .. args.file, out, depth)
++				local failed = type(out) == "string" and not out:match("^File created")
++				if failed then
++					frame.last_tool_ok = false
++				else
++					tools_changes.record_write(frame, args.file, args.content)
++				end
++				note_call("write: " .. args.file, failed)
++				append_output("write: " .. args.file, out, depth, failed)
+ 			end
+ 		elseif name == "subtask" then
+ 			local first_sub
+@@ -782,42 +1168,70 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 					break
+ 				end
+ 			end
+-			local goal = args.goal or args.Goal or args.task
+-			if type(goal) == "number" then
+-				goal = tostring(goal)
++			local step = tonumber(args.step)
++			local plan_item
++			if step then
++				plan_item = tools_plan.item(frame, step)
+ 			end
+-			if type(goal) == "string" then
+-				goal = goal:match("^%s*(.-)%s*$") or goal
+-			else
+-				goal = nil
++			local goals = agent.parse_goals(args.goal or args.Goal or args.task, args.goals)
++			if plan_item and #goals == 0 then
++				goals = { plan_item.goal }
+ 			end
++			local goal = goals[1]
+ 			local parent_goal = tools_subtask.frame_goal(frame)
++			local role_src = args.role or (plan_item and plan_item.agent)
++			local role = agent.parse_role(role_src, { profile = "subtask", tools = args.tools })
+ 			if first_sub and i ~= first_sub then
+-				M.append("subtask skipped: only one per turn\n", depth)
+ 				res.content = "Only one subtask per turn. Wait for this step, then continue."
++				append_output("subtask skipped", res.content, depth, true)
++				note_call("subtask skipped", true)
++			elseif step and not plan_item then
++				res.content = "plan item " .. tostring(step) .. " not found. Write a plan first."
++				append_output("subtask failed: no plan item " .. tostring(step), res.content, depth, true)
++				note_call("subtask: no plan item " .. tostring(step), true)
+ 			elseif not goal or goal == "" then
+-				M.append("subtask failed: no goal\n", depth)
+ 				res.content = "missing goal"
++				append_output("subtask failed: no goal", res.content, depth, true)
++				note_call("subtask: no goal", true)
+ 			elseif parent_goal ~= "" and tools_subtask.same_goal(parent_goal, goal) then
+-				M.append("subtask failed: goal copies the current Goal\n", depth)
+ 				res.content = "goal must be a more specific next step, not a copy of the current Goal: "
+ 					.. goal
++				append_output("subtask failed: goal copies the current Goal", res.content, depth, true)
++				note_call("subtask: " .. goal, true)
+ 			elseif #stack &gt;= (agent.MAX_DEPTH or 8) then
+-				M.append("subtask failed: max depth\n", depth)
+ 				res.content = "max subtask depth reached"
++				append_output("subtask failed: max depth", res.content, depth, true)
++				note_call("subtask: max depth", true)
+ 			else
+-				local child_tools = agent.sanitize_subtask_tools(args.tools)
+ 				local child_depth = #stack
+-				M.append("SUBTASK " .. goal .. "\n", depth)
+-				M.append("tools: " .. table.concat(child_tools, ", ") .. "\n", child_depth)
+ 				local child = agent.new_frame({
+ 					profile = "subtask",
++					role = role,
+ 					system_prompt = args.system_prompt,
+-					tools = child_tools,
++					tools = role == "orchestrator" and nil or args.tools,
+ 					goal = goal,
++					goals = goals,
+ 					depth = child_depth,
+ 					parent_call_id = call.id,
++					task_notes = plan_item and plan_item.notes or "",
++					plan_step = step,
++					plan_root = frame.plan_root or frame.plan,
++					plan_path = step and tools_plan.child_path(frame, step) or (frame.plan_path or {}),
+ 				})
++				if plan_item then
++					tools_plan.mark(frame, step, "running")
++				end
++				local n = #(child.goals or {})
++				local head = child.label or "SUBTASK"
++				if n &gt; 1 then
++					M.append(string.format("%s %s (1/%d)\n", head, goal, n), depth)
++				else
++					M.append(head .. " " .. goal .. "\n", depth)
++				end
++				if child.tools and #child.tools &gt; 0 then
++					M.append("tools: " .. table.concat(child.tools, ", ") .. "\n", child_depth)
++				end
++				note_call("subtask: " .. goal, false)
+ 				child.on_parent_resume = function(report)
+ 					frame.continue_after_tools = true
+ 					res.content = report
+@@ -836,23 +1250,39 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 			-- Notes is briefing, not work. Keep the worker so it can subtask next.
+ 			frame.continue_after_tools = true
+ 			local body = tools_subtask.get_notes()
++			local notes_fail = type(out) == "string" and out:match("^Error")
+ 			if body ~= "" then
+-				append_output("notes: " .. (args.action or "?"), body, depth)
++				append_output("notes: " .. (args.action or "?"), body, depth, notes_fail)
+ 			else
+-				M.append("notes: " .. out .. "\n", depth)
++				append_output("notes: " .. (args.action or "?"), out, depth, notes_fail)
++			end
++			note_call("notes: " .. (args.action or "?"), notes_fail)
++		elseif name == "plan" then
++			local out = tools_plan.run(args, frame)
++			res.content = out
++			frame.continue_after_tools = true
++			note_call("plan: " .. (args.action or "?"), type(out) == "string" and out:match("^Error"))
++			if args.action == "write" or args.action == "update" then
++				print_plan(frame, args.action)
+ 			end
+ 		elseif name == "skill" then
+ 			local out = tools_skill.run(args)
+ 			res.content = out
+ 			append_output("skill: " .. (args.action or "?"), out, depth)
++			note_call("skill: " .. (args.action or "?"), false)
+ 		elseif name == "mcp" then
+ 			local async_actions = { connect = true, call = true }
+ 			if async_actions[args.action] then
+-				M.append("mcp: " .. (args.action or "?") .. "\n{{{\n", depth)
++				M.append("{{{ mcp: " .. (args.action or "?") .. "\n", depth)
+ 				current_state = "tools"
+ 				update_input_name()
+ 				tools_mcp.run(args, function(out)
+ 					res.content = tools_io.limit_output(out or "", "mcp")
++					if type(out) == "string" and out:match("^Error") then
++						frame.last_tool_ok = false
++						mark_last_fold_failed()
++					end
++					note_call("mcp: " .. (args.action or "?"), type(out) == "string" and out:match("^Error"))
+ 					M.append((out or "") .. "\n}}}\n", depth)
+ 					refresh_and_close_folds()
+ 					finish_one()
+@@ -861,18 +1291,25 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 			end
+ 			local out = tools_mcp.run(args)
+ 			res.content = out
+-			append_output("mcp: " .. (args.action or "?"), out or "", depth)
++			local mcp_fail = type(out) == "string" and out:match("^Error")
++			append_output("mcp: " .. (args.action or "?"), out or "", depth, mcp_fail)
++			note_call("mcp: " .. (args.action or "?"), mcp_fail)
+ 		elseif name == "send_image" then
+ 			if not args.file then
+-				M.append("image: missing file\n", depth)
+ 				res.content = "Missing file field"
++				append_output("image: missing file", res.content, depth, true)
++				note_call("image: missing file", true)
++				frame.last_tool_ok = false
+ 			else
+ 				local image_url, err = tools_subtask.image_data_url(args.file)
+ 				if not image_url then
+-					M.append("image: " .. args.file .. " failed: " .. err .. "\n", depth)
+ 					res.content = "Error: " .. err
++					append_output("image: " .. args.file, res.content, depth, true)
++					note_call("image: " .. args.file, true)
++					frame.last_tool_ok = false
+ 				else
+-					M.append("image: " .. args.file .. "\n", depth)
++					append_output("image: " .. args.file, args.prompt or "sent", depth)
++					note_call("image: " .. args.file, false)
+ 					local content = {}
+ 					if args.prompt then
+ 						table.insert(content, { type = "text", text = args.prompt })
+@@ -886,7 +1323,9 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 			end
+ 		else
+ 			res.content = "Invalid tool name: " .. (name or "")
+-			M.append("invalid tool: " .. (name or "") .. "\n", depth)
++			append_output("invalid tool: " .. (name or ""), res.content, depth, true)
++			note_call("invalid tool: " .. (name or ""), true)
++			frame.last_tool_ok = false
+ 		end
+ 
+ 		finish_one()
+@@ -926,9 +1365,15 @@ function M.send_input()
+ 			local command = args.command
+ 			if response == "y" or response == "yes" then
+ 				M.append("Confirmed...\n", depth)
+-				M.append("shell: " .. tostring(command) .. "\n{{{\n", depth)
+-				run_live_shell(command, function(out)
++				M.append("{{{ shell: " .. tostring(command) .. "\n", depth)
++				run_live_shell(command, function(out, code)
+ 					res.content = tools_io.limit_output(out, "shell")
++					local failed = (code or 0) ~= 0
++					tools_changes.record_command(frame, command, failed)
++					if failed then
++						frame.last_tool_ok = false
++						mark_last_fold_failed()
++					end
+ 					M.append((out or "") .. "\n}}}\n", depth)
+ 					refresh_and_close_folds()
+ 					record_tool_output(frame, res.content)
+@@ -940,8 +1385,7 @@ function M.send_input()
+ 				end, depth)
+ 				return
+ 			elseif response == "s" or response == "stop" then
+-				M.append("Stopped\n", depth)
+-				M.append("shell stopped: " .. tostring(command) .. "\n", depth)
++				append_output("shell: " .. tostring(command), "User stopped execution.", depth, true)
+ 				hard_stop = true
+ 				res.content = "User stopped execution."
+ 				record_tool_output(frame, res.content)
+@@ -953,8 +1397,8 @@ function M.send_input()
+ 				maybe_auto_save()
+ 				return
+ 			else
+-				M.append("shell declined: " .. tostring(command) .. "\n", depth)
+ 				res.content = "User declined running this command: " .. input
++				append_output("shell: " .. tostring(command), res.content, depth, true)
+ 				record_tool_output(frame, res.content)
+ 				table.insert(history, res)
+ 				table.remove(pending_tools, 1)
+@@ -967,6 +1411,7 @@ function M.send_input()
+ 			if not is_worker() then
+ 				frame.goal = input
+ 				frame.steps = {}
++				frame.phase = "decompose"
+ 			end
+ 			table.insert(history, { role = "user", content = input })
+ 			add_sep("___ USER ")
+@@ -1054,6 +1499,12 @@ end
+ 
+ function M.continue()
+ 	local frame = top()
++	frame.turns = (frame.turns or 0) + 1
++	if agent.iterates(frame) and frame.turns &gt; (agent.MAX_CODER_TURNS or 12) then
++		M.append("coder turn limit\n", nest_depth(frame))
++		finish_oneshot(frame, frame.last_assistant or "(turn limit)", "ok")
++		return
++	end
+ 	local hist = frame.history
+ 	local cfg = frame_config(frame)
+ 	local msgs = prepare_messages(frame)
+@@ -1064,6 +1515,15 @@ function M.continue()
+ 	update_input_name()
+ 
+ 	local function on_idle_no_tools(content)
++		if frame.role == "orchestrator"
++			and (frame.phase == "decompose" or frame.phase == "revise") then
++			after_orchestrator_turn(frame, content)
++			return
++		end
++		if frame.last_tool_ok == false and tools_subtask.is_weak_reply(content or "") then
++			M.continue()
++			return
++		end
+ 		if is_worker() then
+ 			finish_oneshot(frame, content or "(no output)")
+ 			return
+</pre>
