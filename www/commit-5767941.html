@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tai.nvim 5767941</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>tai.nvim</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 5767941
+parent <a href=commit-a5a569c.html>a5a569c</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-10-23T11:21:46-03:00
+
+    Add visual and insert modes that skip the planner.
+
+    A selection or motion can be sent on its own, or with an instruction. Insert mode completes at the cursor or inserts a prompted reply. Ctrl-X is mapped itself so Ctrl-T is not thesaurus completion.
+
+<a href=tree-5767941.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 36ebf26..c4d0c4e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -9,6 +9,7 @@ These notes are intended for **automated coding agents** working in this reposit
+ 
+ - `lua/tai/` — Neovim plugin implementation (all core logic)
+   - `init.lua` — plugin entrypoint (`setup`, `chat`, `stop`, …); connects MCPs
++  - `inline.lua` — visual selection, insert complete, and insert-at-cursor (own prompts, no planner)
+   - `config.lua` — defaults + `.tai` project config (`mcps`, …)
+   - `agent.lua` — main/subtask system prompts, `new_frame`, tool allowlists
+   - `mcp.lua` — MCP client (stdio + HTTP); status/connect/call
+@@ -93,6 +94,13 @@ it does not see the user's chat; its final text is the step response.
+ 
+ - **Change system prompts**
+   - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`).
++  - Inline editor actions: `lua/tai/inline.lua`.
++
++- **Inline editor actions**
++  - Keymaps live in the user's Neovim `init.lua`. The plugin does not bind keys.
++  - `&lt;leader&gt;tv` sends a visual selection or a motion. `gP` asks for an instruction first.
++  - Map `&lt;C-X&gt;` to `tai.ctrl_x` (`expr`). `&lt;C-T&gt;` completes at the cursor. `&lt;C-A&gt;` asks, then inserts the reply. Other `&lt;C-X&gt;` keys stay normal completion.
++  - These calls set `no_tools` and `stateless` and do not enter planner history.
+ 
+ - **Provider-side tools (e.g. web_search)**
+   - `.tai` field `provider_tools`.
+diff --git a/lua/tai/init.lua b/lua/tai/init.lua
+index a16ff40..de45a37 100644
+--- a/lua/tai/init.lua
++++ b/lua/tai/init.lua
+@@ -5,8 +5,243 @@ local config = require("tai.config")
+ local ui = require("tai.ui")
+ local mcp = require("tai.mcp")
+ local tools = require("tai.tools")
++local inline = require("tai.inline")
++
++local function blank(s)
++	return type(s) ~= "string" or s:match("^%s*$") ~= nil
++end
++
++local function ui_mod()
++	if type(ui.inline_request) ~= "function" then
++		vim.notify("tai: no provider configured", vim.log.levels.WARN)
++		return nil
++	end
++	return ui
++end
++
++local function resume_insert(ctx)
++	if not ctx or not ctx.return_insert then
++		return
++	end
++	local mode = vim.api.nvim_get_mode().mode
++	if mode:sub(1, 1) == "i" then
++		return
++	end
++	local win = ctx.win
++	if win and vim.api.nvim_win_is_valid(win) then
++		vim.api.nvim_set_current_win(win)
++	end
++	vim.cmd("startinsert")
++end
++
++local function note_error(ctx, err)
++	if err == "stopped" then
++		resume_insert(ctx)
++		return
++	end
++	if err == "busy" then
++		vim.notify("tai: busy", vim.log.levels.WARN)
++	else
++		vim.notify("tai: " .. tostring(err), vim.log.levels.ERROR)
++	end
++	resume_insert(ctx)
++end
++
++local function place_text(ctx, raw)
++	local text = inline.reply_text(ctx.insert_kind or "insert", raw, ctx)
++	if text == "" then
++		vim.notify("tai: empty reply", vim.log.levels.WARN)
++		resume_insert(ctx)
++		return
++	end
++	local buf = ctx.buf
++	if not buf or not vim.api.nvim_buf_is_valid(buf) then
++		vim.notify("tai: buffer is gone", vim.log.levels.WARN)
++		resume_insert(ctx)
++		return
++	end
++	local line = vim.api.nvim_buf_get_lines(buf, ctx.row - 1, ctx.row, false)[1] or ""
++	local moved = false
++	if ctx.line_at ~= nil then
++		moved = line ~= ctx.line_at
++	else
++		moved = line:sub(1, ctx.col) ~= (ctx.line_prefix or "")
++	end
++	if moved then
++		vim.notify("tai: buffer changed, reply discarded", vim.log.levels.WARN)
++		resume_insert(ctx)
++		return
++	end
++	local in_insert = vim.api.nvim_get_mode().mode:sub(1, 1) == "i"
++	if in_insert then
++		vim.cmd("stopinsert")
++	end
++	local _, row_off, new_col = inline.splice(line, ctx.col, text)
++	local lines = vim.split(text, "\n", { plain = true })
++	local wrote, write_err = pcall(vim.api.nvim_buf_set_text, buf, ctx.row - 1, ctx.col, ctx.row - 1, ctx.col, lines)
++	if not wrote then
++		vim.notify("tai: " .. tostring(write_err), vim.log.levels.ERROR)
++		resume_insert(ctx)
++		return
++	end
++	local new_row = ctx.row + row_off
++	local win = ctx.win
++	if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
++		vim.api.nvim_set_current_win(win)
++		pcall(vim.api.nvim_win_set_cursor, win, { new_row, new_col })
++	end
++	if in_insert or ctx.return_insert then
++		vim.cmd("startinsert")
++	end
++end
++
++local function ask_insert(kind, ctx)
++	local view = ui_mod()
++	if not view then
++		resume_insert(ctx)
++		return
++	end
++	local label = (kind == "complete") and "Tai: completing…" or "Tai: writing at the cursor…"
++	vim.notify(label, vim.log.levels.INFO)
++	ctx.insert_kind = kind
++	view.inline_request(inline.messages(kind, ctx), kind, function(raw, err)
++		if err then
++			note_error(ctx, err)
++			return
++		end
++		place_text(ctx, raw)
++	end)
++end
++
++local function region_missing(sel)
++	return not sel or sel.text == nil or not sel.start_line or sel.start_line == 0
++end
++
++local function deliver_selection(sel)
++	local view = ui_mod()
++	if not view then
++		return
++	end
++	if region_missing(sel) or (blank(sel.text) and blank(sel.instruction)) then
++		vim.notify("tai: empty selection", vim.log.levels.WARN)
++		return
++	end
++	local kind = blank(sel.instruction) and "selection" or "selection_prompt"
++	vim.notify("Tai: asking about the selection…", vim.log.levels.INFO)
++	view.inline_request(inline.messages(kind, sel), kind, function(raw, err)
++		if err then
++			note_error(nil, err)
++			return
++		end
++		local text = inline.reply_text(kind, raw, sel)
++		if text == "" then
++			vim.notify("tai: empty reply", vim.log.levels.WARN)
++			return
++		end
++		view.show_exchange("SELECTION", inline.preview(sel), text)
++	end)
++end
++
++function M.visual_send()
++	local kind = vim.fn.visualmode()
++	if kind == "" then
++		kind = "v"
++	end
++	deliver_selection(inline.capture(0, "&lt;", "&gt;", kind))
++end
++
++function M.visual_prompt()
++	local kind = vim.fn.visualmode()
++	if kind == "" then
++		kind = "v"
++	end
++	local sel = inline.capture(0, "&lt;", "&gt;", kind)
++	if region_missing(sel) then
++		vim.notify("tai: empty selection", vim.log.levels.WARN)
++		return
++	end
++	vim.ui.input({ prompt = "Tai selection: " }, function(input)
++		if blank(input) then
++			return
++		end
++		sel.instruction = input
++		deliver_selection(sel)
++	end)
++end
++
++function M.operator_send(type)
++	deliver_selection(inline.capture(0, "[", "]", type or "char"))
++end
++
++function M.operator_send_with_prompt(type)
++	local sel = inline.capture(0, "[", "]", type or "char")
++	if region_missing(sel) then
++		vim.notify("tai: empty selection", vim.log.levels.WARN)
++		return
++	end
++	vim.ui.input({ prompt = "Tai selection: " }, function(input)
++		if blank(input) then
++			return
++		end
++		sel.instruction = input
++		deliver_selection(sel)
++	end)
++end
++
++function M.complete()
++	local ctx = inline.capture_cursor()
++	ctx.return_insert = true
++	ask_insert("complete", ctx)
++end
++
++function M.prompt_insert()
++	local ctx = inline.capture_cursor()
++	ctx.return_insert = true
++	vim.ui.input({ prompt = "Tai insert: " }, function(input)
++		if blank(input) then
++			resume_insert(ctx)
++			return
++		end
++		ctx.instruction = input
++		ask_insert("insert", ctx)
++	end)
++end
++
++-- Insert-mode &lt;C-X&gt; opens completion mode before a two-key map can run, so
++-- &lt;C-T&gt; would stay thesaurus completion. This reads the next key first.
++function M.ctrl_x()
++	local ok, key = pcall(vim.fn.getcharstr)
++	if not ok or type(key) ~= "string" or key == "" then
++		return ""
++	end
++	local function same(name)
++		return key == vim.api.nvim_replace_termcodes(name, true, false, true)
++	end
++	if same("&lt;C-T&gt;") then
++		vim.schedule(function()
++			M.complete()
++		end)
++		return ""
++	end
++	if same("&lt;C-A&gt;") then
++		vim.schedule(function()
++			M.prompt_insert()
++		end)
++		return ""
++	end
++	return vim.api.nvim_replace_termcodes("&lt;C-X&gt;", true, false, true) .. key
++end
++
++function _G.tai_operator_send(type)
++	M.operator_send(type)
++end
++
++function _G.tai_operator_send_with_prompt(type)
++	M.operator_send_with_prompt(type)
++end
+ 
+ function M.setup(opts)
++	opts = opts or {}
+ 	log.set_level(opts.log_level or log.DEBUG)
+ 
+ 	if not config.provider then
+diff --git a/lua/tai/inline.lua b/lua/tai/inline.lua
+new file mode 100644
+index 0000000..412bbb2
+--- /dev/null
++++ b/lua/tai/inline.lua
+@@ -0,0 +1,463 @@
++-- One-shot editor actions. Each kind has its own system prompt and never
++-- enters the planner. selection / selection_prompt answer in the chat.
++-- complete / insert return only the text to place at the cursor.
++
++local M = {}
++
++M.limits = {
++	before = 6000,
++	after = 2500,
++	selection = 12000,
++}
++
++M.prompts = {}
++
++M.prompts.selection = [[
++You are Tai in Neovim. The user selected text and sent it with no other instruction.
++
++If the selection asks a question or requests a change, answer that request.
++If the selection is code, explain what it does in a few sentences and name the important symbols.
++
++Use only the selection. Do not invent files, commands, or a plan.
++Plain sentences. No markdown heading. No code fence unless a short snippet is required to answer.
++]]
++
++M.prompts.selection_prompt = [[
++You are Tai in Neovim. The user selected a region and wrote an instruction.
++
++Follow the instruction. The selection is the only source text you can see.
++Do not invent files or a plan.
++Write a direct answer. No preamble.
++If the instruction asks for code, put that code in one fenced block and add nothing else.
++]]
++
++M.prompts.complete = [[
++You are the autocomplete for a Neovim buffer.
++
++The user message is the cursor position.
++&lt;before&gt; is the text before the cursor.
++&lt;after&gt; is the text after the cursor.
++
++Return only the missing characters between &lt;before&gt; and &lt;after&gt;.
++Do not repeat characters already in &lt;before&gt; or &lt;after&gt;.
++Do not add a fence, a quote, or an explanation.
++Copy the file's indentation and names.
++Stop at the end of the current statement. Continue onto another line only when the current line is unfinished.
++]]
++
++M.prompts.insert = [[
++You are writing text that Neovim will insert at the cursor.
++
++The user message has an instruction, &lt;before&gt; (text before the cursor), and &lt;after&gt; (text after the cursor).
++Follow the instruction.
++Return only the insertion. It must read correctly between &lt;before&gt; and &lt;after&gt;.
++Do not repeat &lt;before&gt; or &lt;after&gt;.
++No explanation, no fence, and no quotes around the whole answer.
++Copy the file's indentation and style.
++]]
++
++local function clip_tail(s, n)
++	if #s &lt;= n then
++		return s
++	end
++	local cut = s:sub(#s - n + 1)
++	local nl = cut:find("\n", 1, true)
++	if nl and nl &lt; #cut then
++		return cut:sub(nl + 1)
++	end
++	return cut
++end
++
++local function clip_head(s, n)
++	if #s &lt;= n then
++		return s
++	end
++	local cut = s:sub(1, n)
++	local last
++	local i = 1
++	while true do
++		local p = cut:find("\n", i, true)
++		if not p then
++			break
++		end
++		last = p
++		i = p + 1
++	end
++	if last and last &gt; 1 then
++		return cut:sub(1, last - 1)
++	end
++	return cut
++end
++
++local function split_lines(text)
++	return vim.split(text, "\n", { plain = true })
++end
++
++function M.strip_thinking(text)
++	if type(text) ~= "string" then
++		return ""
++	end
++	local lower = text:sub(1, 8)
++	local tag, closer
++	if lower:sub(1, 7) == "&lt;think&gt;" then
++		tag, closer = 7, "&lt;/think&gt;"
++	elseif text:sub(1, 10) == "&lt;thinking&gt;" then
++		tag, closer = 10, "&lt;/thinking&gt;"
++	end
++	if not tag then
++		return text
++	end
++	local close = text:find(closer, tag + 1, true)
++	if not close then
++		return text
++	end
++	return (text:sub(close + #closer):gsub("^%s+", ""))
++end
++
++function M.unwrap_fence(text)
++	if type(text) ~= "string" then
++		return ""
++	end
++	text = text:gsub("\r\n", "\n"):gsub("^\239\187\191", "")
++	local trimmed = text:gsub("%s+$", "")
++	local lines = split_lines(trimmed)
++	local function is_open(line)
++		return line:gsub("%s+$", ""):match("^```[%w_.+-]*$") ~= nil
++	end
++	local function is_close(line)
++		return line:gsub("%s+$", ""):match("^```$") ~= nil
++	end
++	if #lines &gt;= 2 and is_open(lines[1]) and is_close(lines[#lines]) then
++		table.remove(lines, 1)
++		table.remove(lines)
++		return table.concat(lines, "\n")
++	end
++	local start_i, end_i
++	for i, line in ipairs(lines) do
++		if not start_i and is_open(line) then
++			start_i = i
++		elseif start_i and is_close(line) then
++			end_i = i
++			break
++		end
++	end
++	if start_i and end_i and end_i &gt; start_i then
++		local body = {}
++		for i = start_i + 1, end_i - 1 do
++			body[#body + 1] = lines[i]
++		end
++		return table.concat(body, "\n")
++	end
++	-- Keep a trailing newline. Completions at the end of the buffer need it.
++	return text:gsub("[ \t]+$", "")
++end
++
++function M.strip_overlap(text, before, after)
++	if type(text) ~= "string" or text == "" then
++		return ""
++	end
++	before = before or ""
++	after = after or ""
++	local limit = math.min(#text, #before)
++	for n = limit, 8, -1 do
++		local piece = text:sub(1, n)
++		if piece:match("%S") and before:sub(-n) == piece then
++			text = text:sub(n + 1)
++			break
++		end
++	end
++	local last_line = before:match("([^\n]*)$") or ""
++	if last_line ~= "" and text:sub(1, #last_line) == last_line then
++		text = text:sub(#last_line + 1)
++	end
++	local next_line = after:match("^\n?([^\n]*)") or ""
++	if next_line ~= "" and #text &gt;= #next_line and text:sub(-#next_line) == next_line then
++		local at = #text - #next_line
++		if at == 0 then
++			text = ""
++		elseif text:sub(at, at) == "\n" then
++			if after:sub(1, 1) == "\n" then
++				text = text:sub(1, at - 1)
++			else
++				text = text:sub(1, at)
++			end
++		end
++	end
++	return text
++end
++
++--- Returns the full line list, the row offset, and the cursor column after insertion.
++function M.splice(line, col, text)
++	line = line or ""
++	col = col or 0
++	local parts = vim.split(text or "", "\n", { plain = true })
++	if #parts == 0 then
++		parts = { "" }
++	end
++	local after = line:sub(col + 1)
++	parts[1] = line:sub(1, col) .. (parts[1] or "")
++	parts[#parts] = parts[#parts] .. after
++	return parts, #parts - 1, #parts[#parts] - #after
++end
++
++function M.prepare_insertion(text, before, after)
++	text = M.unwrap_fence(M.strip_thinking(text))
++	if (after or "") ~= "" then
++		text = text:gsub("\n+$", "")
++	end
++	return M.strip_overlap(text, before, after)
++end
++
++function M.reply_text(kind, raw, ctx)
++	local text = M.strip_thinking(raw or "")
++	text = text:gsub("\r\n", "\n")
++	if kind == "complete" or kind == "insert" then
++		local before = ctx and ctx.before or ""
++		local after = ctx and ctx.after or ""
++		return M.prepare_insertion(text, before, after)
++	end
++	return text:gsub("%s+$", "")
++end
++
++--- row is 1-indexed. col is the 0-indexed byte where new text is inserted.
++function M.cursor_view(buf, row, col, lines, path, filetype)
++	lines = lines or {}
++	row = row or 1
++	col = col or 0
++	if row &lt; 1 then
++		row = 1
++	end
++	if row &gt; #lines then
++		row = #lines
++	end
++	local cur = lines[row] or ""
++	if col &lt; 0 then
++		col = 0
++	end
++	if col &gt; #cur then
++		col = #cur
++	end
++	local line_before = cur:sub(1, col)
++	local line_after = cur:sub(col + 1)
++	local before
++	if row &gt; 1 then
++		before = table.concat(lines, "\n", 1, row - 1) .. "\n" .. line_before
++	else
++		before = line_before
++	end
++	local after
++	if row &lt; #lines then
++		after = line_after .. "\n" .. table.concat(lines, "\n", row + 1, #lines)
++	else
++		after = line_after
++	end
++	return {
++		buf = buf,
++		row = row,
++		col = col,
++		path = path or "",
++		filetype = (filetype and filetype ~= "") and filetype or "text",
++		before = clip_tail(before, M.limits.before),
++		after = clip_head(after, M.limits.after),
++		line_prefix = line_before,
++		line_at = cur,
++	}
++end
++
++function M.capture_cursor(win)
++	win = win or vim.api.nvim_get_current_win()
++	local buf = vim.api.nvim_win_get_buf(win)
++	local cursor = vim.api.nvim_win_get_cursor(win)
++	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
++	local view = M.cursor_view(
++		buf,
++		cursor[1],
++		cursor[2],
++		lines,
++		vim.api.nvim_buf_get_name(buf),
++		vim.bo[buf].filetype
++	)
++	view.win = win
++	return view
++end
++
++--- srow/erow are 1-indexed. scol/ecol are 0-indexed inclusive byte columns.
++--- kind is "char"|"line"|"block", or a visualmode() value "v"|"V"|"\\22".
++function M.region_text(lines, srow, scol, erow, ecol, kind)
++	lines = lines or {}
++	if #lines == 0 then
++		return ""
++	end
++	srow = srow or 1
++	erow = erow or srow
++	scol = scol or 0
++	ecol = ecol or scol
++	if srow &gt; erow or (srow == erow and scol &gt; ecol) then
++		srow, erow = erow, srow
++		scol, ecol = ecol, scol
++	end
++	if srow &lt; 1 then
++		srow = 1
++	end
++	if erow &gt; #lines then
++		erow = #lines
++	end
++	if srow &gt; erow then
++		return ""
++	end
++	local chunk = {}
++	for i = srow, erow do
++		chunk[#chunk + 1] = lines[i] or ""
++	end
++	if kind == "line" or kind == "V" then
++		return table.concat(chunk, "\n")
++	end
++	if kind == "block" or kind == "\022" then
++		local left, right = scol, ecol
++		if left &gt; right then
++			left, right = right, left
++		end
++		local out = {}
++		for _, line in ipairs(chunk) do
++			if left &gt;= #line then
++				out[#out + 1] = ""
++			else
++				out[#out + 1] = line:sub(left + 1, math.min(#line, right + 1))
++			end
++		end
++		return table.concat(out, "\n")
++	end
++	if srow == erow then
++		return (chunk[1] or ""):sub(scol + 1, ecol + 1)
++	end
++	local out = { (chunk[1] or ""):sub(scol + 1) }
++	for i = 2, #chunk - 1 do
++		out[#out + 1] = chunk[i]
++	end
++	out[#out + 1] = (chunk[#chunk] or ""):sub(1, ecol + 1)
++	return table.concat(out, "\n")
++end
++
++function M.capture(buf, start_mark, end_mark, kind)
++	buf = buf or 0
++	local s = vim.api.nvim_buf_get_mark(buf, start_mark)
++	local e = vim.api.nvim_buf_get_mark(buf, end_mark)
++	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
++	local text = ""
++	local srow, erow = s[1], e[1]
++	if srow &gt; 0 and erow &gt; 0 then
++		text = M.region_text(lines, srow, s[2], erow, e[2], kind)
++		if srow &gt; erow then
++			srow, erow = erow, srow
++		end
++	end
++	local path = ""
++	local ft = "text"
++	if vim.api.nvim_buf_is_valid(buf == 0 and vim.api.nvim_get_current_buf() or buf) then
++		path = vim.api.nvim_buf_get_name(buf)
++		ft = vim.bo[buf].filetype
++		if ft == nil or ft == "" then
++			ft = "text"
++		end
++	end
++	return {
++		buf = buf,
++		text = text,
++		path = path,
++		filetype = ft,
++		start_line = srow,
++		end_line = erow,
++		kind = kind or "char",
++	}
++end
++
++local function file_label(ctx)
++	local path = ctx and ctx.path or ""
++	if path == "" then
++		path = "[No Name]"
++	end
++	local ft = ctx and ctx.filetype or ""
++	if ft == "" then
++		ft = "text"
++	end
++	return path, ft
++end
++
++function M.user_text(kind, ctx)
++	ctx = ctx or {}
++	local path, ft = file_label(ctx)
++	if kind == "selection" or kind == "selection_prompt" then
++		local body = ctx.text or ""
++		local note = nil
++		if #body &gt; M.limits.selection then
++			body = body:sub(1, M.limits.selection)
++			note = "(selection truncated)"
++		end
++		local lines = {
++			"File: " .. path,
++			"Filetype: " .. ft,
++			string.format("Lines: %s-%s", tostring(ctx.start_line or "?"), tostring(ctx.end_line or "?")),
++		}
++		if kind == "selection_prompt" then
++			lines[#lines + 1] = ""
++			lines[#lines + 1] = "Instruction:"
++			lines[#lines + 1] = ctx.instruction or ""
++		end
++		if note then
++			lines[#lines + 1] = note
++		end
++		lines[#lines + 1] = ""
++		lines[#lines + 1] = "&lt;selection&gt;"
++		lines[#lines + 1] = body
++		lines[#lines + 1] = "&lt;/selection&gt;"
++		return table.concat(lines, "\n")
++	end
++	local lines = {
++		"File: " .. path,
++		"Filetype: " .. ft,
++		string.format("Cursor: line %d, column %d", ctx.row or 1, (ctx.col or 0) + 1),
++	}
++	if kind == "insert" then
++		lines[#lines + 1] = ""
++		lines[#lines + 1] = "Instruction:"
++		lines[#lines + 1] = ctx.instruction or ""
++	end
++	lines[#lines + 1] = ""
++	lines[#lines + 1] = "&lt;before&gt;"
++	lines[#lines + 1] = ctx.before or ""
++	lines[#lines + 1] = "&lt;/before&gt;"
++	lines[#lines + 1] = "&lt;after&gt;"
++	lines[#lines + 1] = ctx.after or ""
++	lines[#lines + 1] = "&lt;/after&gt;"
++	return table.concat(lines, "\n")
++end
++
++function M.messages(kind, ctx)
++	local prompt = M.prompts[kind]
++	if not prompt then
++		error("unknown inline kind: " .. tostring(kind))
++	end
++	return {
++		{ role = "system", content = prompt },
++		{ role = "user", content = M.user_text(kind, ctx) },
++	}
++end
++
++function M.preview(sel)
++	sel = sel or {}
++	local path = sel.path
++	if path == nil or path == "" then
++		path = "[No Name]"
++	end
++	local body = sel.text or ""
++	if #body &gt; 1500 then
++		body = body:sub(1, 1500) .. "\n…"
++	end
++	local head = string.format("%s:%s-%s", path, tostring(sel.start_line or "?"), tostring(sel.end_line or "?"))
++	if sel.instruction and sel.instruction ~= "" then
++		return head .. "\n" .. sel.instruction .. "\n\n" .. body
++	end
++	return head .. "\n" .. body
++end
++
++return M
+diff --git a/lua/tai/providers.lua b/lua/tai/providers.lua
+index 254d3df..62aaf63 100644
+--- a/lua/tai/providers.lua
++++ b/lua/tai/providers.lua
+@@ -224,18 +224,24 @@ local function create_provider_module(provider_name)
+ 
+ 	local M_module = {}
+ 
++	-- Inline editor actions set no_tools so a completion cannot call the planner.
++	local function tools_enabled(model_config)
++		return config.use_tools ~= false and not (model_config and model_config.no_tools)
++	end
++
+ 	-- Build request body based on provider configuration
+ 	local function build_body(model_config, msgs)
+ 		-- Keep connected files up to date in history before sending
+-		local agent_tools = common.build_request_tools(provider_config.api_format, model_config.tools)
+-
+ 		local body = {
+ 			model = model_config.model,
+ 			messages = common.filter_messages(msgs),
+ 		}
+ 
+-		if config.use_tools ~= false and #agent_tools &gt; 0 then
+-			body.tools = agent_tools
++		if tools_enabled(model_config) then
++			local agent_tools = common.build_request_tools(provider_config.api_format, model_config.tools)
++			if #agent_tools &gt; 0 then
++				body.tools = agent_tools
++			end
+ 		end
+ 
+ 		if model_config.think ~= nil then
+@@ -327,12 +333,19 @@ local function create_provider_module(provider_name)
+ 				M_module.request(model_config, msgs, callback)
+ 			end
+ 
+-			for _, msg in ipairs(msgs) do
+-				add_history_message(vim.deepcopy(msg))
++			-- A stateless call (inline complete / selection) must not join the chat history.
++			local source
++			if model_config.stateless then
++				source = msgs
++			else
++				for _, msg in ipairs(msgs) do
++					add_history_message(vim.deepcopy(msg))
++				end
++				source = history or {}
+ 			end
+ 
+ 			local input = {}
+-			for _, msg in ipairs(history or {}) do
++			for _, msg in ipairs(source) do
+ 				local new_msg = {}
+ 				for k, v in pairs(msg) do
+ 					if k ~= "file_path" and k ~= "file_range" then
+@@ -352,7 +365,7 @@ local function create_provider_module(provider_name)
+ 				store = false,
+ 			}
+ 
+-			if config.use_tools ~= false then
++			if tools_enabled(model_config) then
+ 				body.tools = common.build_request_tools("responses", model_config.tools)
+ 			end
+ 
+@@ -492,7 +505,7 @@ local function create_provider_module(provider_name)
+ 				stream = true,
+ 			}
+ 
+-			if config.use_tools ~= false then
++			if tools_enabled(model_config) then
+ 				body.tools = common.build_request_tools("responses", model_config.tools)
+ 			end
+ 
+@@ -652,10 +665,16 @@ local function create_provider_module(provider_name)
+ 		messages = common.filter_messages(msgs),
+ 	}
+ 
+-	if config.use_tools ~= false then
++	if tools_enabled(model_config) then
+ 		body.tools = common.build_request_tools(provider_config.api_format, model_config.tools)
+ 	end
+ 
++	-- llama-server only parses Gemma's &lt;|\"|&gt; calls when a tool call is required.
++	-- Otherwise the native call is left in message content and never runs.
++	if model_config.tool_choice and body.tools and #body.tools &gt; 0 then
++		body.tool_choice = model_config.tool_choice
++	end
++
+ 	if model_config.think ~= nil then
+ 		body.reasoning_effort = model_config.think
+ 	end
+diff --git a/lua/tai/tests/inline_test.lua b/lua/tai/tests/inline_test.lua
+new file mode 100644
+index 0000000..b58cee9
+--- /dev/null
++++ b/lua/tai/tests/inline_test.lua
+@@ -0,0 +1,203 @@
++-- Run: nvim --headless -u NONE --noplugin -c "set rtp+=." -c "luafile lua/tai/tests/inline_test.lua" -c "qa!"
++
++local passed, failed = 0, 0
++
++local function assert_eq(a, b, msg)
++	if a == b then
++		passed = passed + 1
++		print("  OK " .. msg)
++	else
++		failed = failed + 1
++		print("  FAIL " .. msg .. " exp=" .. vim.inspect(a) .. " got=" .. vim.inspect(b))
++	end
++end
++
++local function assert_true(v, msg)
++	if v then
++		passed = passed + 1
++		print("  OK " .. msg)
++	else
++		failed = failed + 1
++		print("  FAIL " .. msg)
++	end
++end
++
++local function assert_match(pat, s, msg)
++	if type(s) == "string" and s:find(pat, 1, true) then
++		passed = passed + 1
++		print("  OK " .. msg)
++	else
++		failed = failed + 1
++		print("  FAIL " .. msg .. " in: " .. tostring(s):sub(1, 180))
++	end
++end
++
++local inline = require("tai.inline")
++
++print("\n=== prompts ===")
++local kinds = { "selection", "selection_prompt", "complete", "insert" }
++for _, kind in ipairs(kinds) do
++	local p = inline.prompts[kind]
++	assert_true(type(p) == "string" and #p &gt; 80, kind .. " prompt")
++	assert_true(not p:find("create_task", 1, true), kind .. " is not the planner")
++end
++assert_true(inline.prompts.selection ~= inline.prompts.selection_prompt, "selection prompts differ")
++assert_true(inline.prompts.complete ~= inline.prompts.insert, "insert prompts differ")
++assert_match("&lt;before&gt;", inline.prompts.complete, "complete names the cursor tags")
++assert_match("&lt;after&gt;", inline.prompts.complete, "complete names the suffix")
++assert_match("instruction", inline.prompts.insert:lower(), "insert prompt follows an instruction")
++assert_match("no other instruction", inline.prompts.selection, "bare selection has no extra instruction")
++assert_match("Follow the instruction", inline.prompts.selection_prompt, "selection prompt follows the instruction")
++assert_match("only the missing characters", inline.prompts.complete, "complete returns an insertion")
++assert_match("only the insertion", inline.prompts.insert, "insert returns an insertion")
++
++print("\n=== messages ===")
++local sel_msgs = inline.messages("selection", {
++	path = "lua/tai/inline.lua",
++	filetype = "lua",
++	start_line = 4,
++	end_line = 6,
++	text = "local M = {}",
++})
++assert_eq("system", sel_msgs[1].role, "selection system role")
++assert_eq(inline.prompts.selection, sel_msgs[1].content, "selection system prompt")
++assert_match("&lt;selection&gt;", sel_msgs[2].content, "selection tag")
++assert_match("local M = {}", sel_msgs[2].content, "selection body")
++assert_true(not sel_msgs[2].content:find("Instruction:", 1, true), "bare selection has no instruction")
++
++local ask_msgs = inline.messages("selection_prompt", {
++	path = "a.lua",
++	filetype = "lua",
++	start_line = 1,
++	end_line = 1,
++	text = "print(1)",
++	instruction = "explain this call",
++})
++assert_eq(inline.prompts.selection_prompt, ask_msgs[1].content, "prompted selection system prompt")
++assert_match("explain this call", ask_msgs[2].content, "instruction is in the user message")
++assert_match("&lt;selection&gt;", ask_msgs[2].content, "prompted selection tag")
++
++local cur_msgs = inline.messages("complete", {
++	path = "a.lua",
++	filetype = "lua",
++	row = 3,
++	col = 4,
++	before = "abc",
++	after = "xyz",
++})
++assert_eq(inline.prompts.complete, cur_msgs[1].content, "complete system prompt")
++assert_match("&lt;before&gt;", cur_msgs[2].content, "complete before tag")
++assert_match("abc", cur_msgs[2].content, "complete before text")
++assert_match("&lt;after&gt;", cur_msgs[2].content, "complete after tag")
++assert_match("xyz", cur_msgs[2].content, "complete after text")
++assert_true(not cur_msgs[2].content:find("Instruction:", 1, true), "complete has no instruction")
++
++local ins_msgs = inline.messages("insert", {
++	path = "a.lua",
++	filetype = "lua",
++	row = 2,
++	col = 0,
++	before = "",
++	after = "return",
++	instruction = "a guard clause",
++})
++assert_eq(inline.prompts.insert, ins_msgs[1].content, "insert system prompt")
++assert_match("a guard clause", ins_msgs[2].content, "insert instruction")
++assert_match("&lt;before&gt;", ins_msgs[2].content, "insert before tag")
++assert_match("&lt;after&gt;", ins_msgs[2].content, "insert after tag")
++
++local huge = string.rep("x", inline.limits.selection + 50)
++local clipped = inline.user_text("selection", { text = huge, path = "a.lua", filetype = "lua" })
++assert_match("(selection truncated)", clipped, "long selection is marked")
++assert_true(clipped:find(string.rep("x", inline.limits.selection + 1), 1, true) == nil, "long selection is cut")
++assert_match(string.rep("x", 40), clipped, "long selection keeps a prefix")
++
++print("\n=== insertion cleanup ===")
++assert_eq("return 1", inline.unwrap_fence("```lua\nreturn 1\n```"), "unwrap fence")
++assert_eq("return 1", inline.unwrap_fence("```lua \nreturn 1\n``` \n"), "unwrap fence with trailing spaces")
++assert_eq("return 1", inline.unwrap_fence("Sure:\n```lua\nreturn 1\n```\n"), "unwrap fenced preamble")
++assert_eq("answer", inline.strip_thinking("&lt;think&gt;\nhidden\n&lt;/think&gt;\nanswer"), "strip thinking")
++assert_eq("(arg)\n  return arg", inline.strip_overlap("local function name(arg)\n  return arg", "local function name", ""), "drop echoed prefix")
++assert_eq("return 1", inline.strip_overlap("        return 1", "        ", "\nend"), "drop echoed indent")
++assert_eq("foo()", inline.prepare_insertion("foo()\nend", "local ", "\nend"), "drop echoed suffix")
++assert_eq("x + 1", inline.prepare_insertion("```lua\nx + 1\n```\n", "total = ", ")"), "mid-line fence loses the extra newline")
++assert_eq("x + 1\n", inline.prepare_insertion("x + 1\n", "total = ", ""), "keep a trailing newline at eof")
++assert_eq("", inline.reply_text("complete", "```\nlocal name\n```", { before = "local name", after = "" }), "echoed completion inserts nothing")
++
++print("\n=== cursor view ===")
++local lines = {}
++for i = 1, 40 do
++	lines[i] = string.format("L%02d %s", i, string.rep("a", 40))
++end
++local view = inline.cursor_view(nil, 20, 4, lines, "src/a.lua", "lua")
++assert_eq("L20 ", view.line_prefix, "prefix is the bytes before the cursor")
++assert_eq(lines[20], view.line_at, "snapshot of the cursor line")
++assert_true(view.before:sub(-4) == "L20 ", "before ends at the cursor")
++assert_true(view.after:sub(1, 2) == "aa", "after starts at the cursor")
++assert_match("L19 ", view.before, "before includes the previous line")
++assert_match("L21 ", view.after, "after includes the next line")
++assert_true(#view.before &lt;= inline.limits.before, "before stays inside the budget")
++assert_true(#view.after &lt;= inline.limits.after, "after stays inside the budget")
++local wide = {}
++for i = 1, 200 do
++	wide[i] = string.rep("b", 80)
++end
++local wide_view = inline.cursor_view(nil, 150, 10, wide, "", "")
++assert_true(#wide_view.before &lt;= inline.limits.before, "clipped before")
++assert_true(#wide_view.after &lt;= inline.limits.after, "clipped after")
++assert_eq(wide[150]:sub(1, 10), wide_view.before:sub(-10), "clip keeps the cursor edge")
++assert_eq("text", wide_view.filetype, "empty filetype is text")
++
++print("\n=== region ===")
++local src = { "abcd", "efgh", "ijkl" }
++assert_eq("bcd\nefg", inline.region_text(src, 1, 1, 2, 2, "char"), "char region")
++assert_eq("bcd\nefg", inline.region_text(src, 2, 2, 1, 1, "v"), "reversed char region")
++assert_eq("abcd\nefgh", inline.region_text(src, 1, 1, 2, 2, "line"), "line region")
++assert_eq("bc\nfg", inline.region_text(src, 1, 1, 2, 2, "block"), "block region")
++assert_eq("", inline.region_text({}, 1, 0, 1, 1, "char"), "empty buffer")
++
++vim.cmd("enew")
++vim.api.nvim_buf_set_lines(0, 0, -1, false, src)
++vim.bo.filetype = "lua"
++vim.api.nvim_buf_set_mark(0, "&lt;", 1, 1, {})
++vim.api.nvim_buf_set_mark(0, "&gt;", 3, 3, {})
++local captured = inline.capture(0, "&lt;", "&gt;", "V")
++assert_eq("abcd\nefgh\nijkl", captured.text, "linewise capture")
++assert_eq("lua", captured.filetype, "capture filetype")
++assert_eq(1, captured.start_line, "capture start")
++assert_eq(3, captured.end_line, "capture end")
++vim.api.nvim_win_set_cursor(0, { 2, 2 })
++local cur = inline.capture_cursor(0)
++assert_eq(2, cur.row, "cursor row")
++assert_eq(2, cur.col, "cursor col")
++assert_eq("ef", cur.line_prefix, "cursor prefix")
++assert_match("ef", cur.before, "cursor before")
++assert_true(cur.after:sub(1, 2) == "gh", "cursor after")
++
++print("\n=== splice ===")
++local one, row_off, col = inline.splice("abcd", 2, "X")
++assert_eq("abXcd", one[1], "splice one line")
++assert_eq(0, row_off, "splice stays on the line")
++assert_eq(3, col, "splice cursor sits after the insert")
++local many, row2, col2 = inline.splice("abcd", 2, "X\nY")
++assert_eq("abX", many[1], "splice first line")
++assert_eq("Ycd", many[2], "splice keeps the tail")
++assert_eq(1, row2, "splice moves down one line")
++assert_eq(1, col2, "splice cursor is after Y")
++
++print("\n=== preview ===")
++local preview = inline.preview({
++	path = "a.lua",
++	start_line = 2,
++	end_line = 4,
++	instruction = "rename it",
++	text = "foo",
++})
++assert_match("a.lua:2-4", preview, "preview range")
++assert_match("rename it", preview, "preview instruction")
++assert_match("foo", preview, "preview body")
++
++print(string.format("\n%d passed, %d failed", passed, failed))
++if failed &gt; 0 then
++	os.exit(1)
++end
+diff --git a/lua/tai/ui/core.lua b/lua/tai/ui/core.lua
+index 6f0fbf9..34e26cd 100644
+--- a/lua/tai/ui/core.lua
++++ b/lua/tai/ui/core.lua
+@@ -32,6 +32,10 @@ local hard_stop = false
+ local pending_tools = nil
+ local current_job = nil
+ local current_state = "idle" -- idle | waiting | throttled | thinking | tools
++local inline_busy = false
++local inline_epoch = 0
++-- True while an inline request owns current_state. Stop must not clear a planner request.
++local inline_state = false
+ 
+ local function top()
+ 	return stack[#stack]
+@@ -222,8 +226,11 @@ end
+ 
+ providers_factory.on_throttle = function()
+ 	vim.schedule(function()
+-		current_state = "throttled"
+-		update_input_name()
++		-- A late notice must not overwrite idle, thinking, or tools.
++		if current_state == "waiting" or inline_busy then
++			current_state = "throttled"
++			update_input_name()
++		end
+ 	end)
+ end
+ 
+@@ -896,6 +903,10 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ end
+ 
+ function M.send_input()
++	if inline_busy then
++		vim.notify("tai: wait for the inline request to finish", vim.log.levels.WARN)
++		return
++	end
+ 	if hard_stop then
+ 		hard_stop = false
+ 	end
+@@ -985,6 +996,16 @@ end
+ 
+ function M.stop()
+ 	hard_stop = true
++	if inline_state then
++		inline_epoch = inline_epoch + 1
++		inline_busy = false
++		inline_state = false
++		if current_state == "waiting" or current_state == "throttled" then
++			current_state = "idle"
++			update_input_name()
++			M.update_chat_name()
++		end
++	end
+ 	if current_job then
+ 		pcall(vim.fn.jobstop, current_job)
+ 		current_job = nil
+@@ -995,7 +1016,9 @@ function M.stop()
+ 	M.append("\n[tai] Stopped by user\n")
+ end
+ 
+-function M.open()
++function M.open(opts)
++	opts = opts or {}
++	local restore_win = opts.restore_win
+ 	vim.schedule(function()
+ 		local chat_window_nr = vim.fn.bufwinnr(M.buffer_nr)
+ 		if chat_window_nr == -1 then
+@@ -1021,6 +1044,9 @@ function M.open()
+ 				input_win = vim.fn.win_getid(input_window_nr)
+ 			end
+ 		end
++		if restore_win and vim.api.nvim_win_is_valid(restore_win) then
++			pcall(vim.api.nvim_set_current_win, restore_win)
++		end
+ 	end)
+ end
+ 
+@@ -1227,4 +1253,100 @@ function M.continue()
+ 	end
+ end
+ 
++local function finish_inline(epoch)
++	if epoch ~= inline_epoch then
++		return false
++	end
++	inline_epoch = inline_epoch + 1
++	inline_busy = false
++	inline_state = false
++	if current_state == "waiting" or current_state == "throttled" then
++		current_state = "idle"
++		update_input_name()
++		M.update_chat_name()
++	end
++	return true
++end
++
++-- One model call with no tools and no planner history.
++-- kind is "complete", "insert", "selection", or "selection_prompt".
++function M.inline_request(messages, kind, callback)
++	callback = callback or function() end
++	if inline_busy or current_state ~= "idle" then
++		callback(nil, "busy")
++		return
++	end
++	if type(messages) ~= "table" or #messages == 0 then
++		callback(nil, "empty request")
++		return
++	end
++	inline_epoch = inline_epoch + 1
++	local epoch = inline_epoch
++	inline_busy = true
++	inline_state = true
++	current_state = "waiting"
++	update_input_name()
++	M.update_chat_name()
++
++	local cfg = vim.deepcopy(config)
++	cfg.no_tools = true
++	cfg.stateless = true
++	cfg.tool_choice = nil
++	cfg.tools = nil
++	local options = {}
++	if type(cfg.options) == "table" then
++		for k, v in pairs(cfg.options) do
++			options[k] = v
++		end
++	end
++	if options.max_tokens == nil and options.max_completion_tokens == nil then
++		options.max_tokens = (kind == "complete") and 400 or 2048
++	end
++	cfg.options = options
++
++	local function done(text, err)
++		vim.schedule(function()
++			if not finish_inline(epoch) then
++				return
++			end
++			callback(text, err)
++		end)
++	end
++
++	local ok, err = pcall(function()
++		provider.request(cfg, messages, function(fields, req_err)
++			if req_err then
++				done(nil, req_err)
++				return
++			end
++			local text = ""
++			if type(fields) == "table" and type(fields.content) == "string" then
++				text = fields.content
++			end
++			done(text, nil)
++		end)
++	end)
++	if not ok then
++		done(nil, err)
++	end
++end
++
++-- Show a selection exchange in the chat buffer. Does not touch planner history.
++function M.show_exchange(label, preview, reply)
++	if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
++		M.init()
++	end
++	local prev = vim.api.nvim_get_current_win()
++	add_sep("___ " .. (label or "TAI") .. " ")
++	if preview and preview ~= "" then
++		M.append(preview .. "\n")
++	end
++	add_sep("___ TAI ")
++	if reply and reply ~= "" then
++		M.append(reply .. "\n")
++	end
++	M.open({ restore_win = prev })
++	scroll_down()
++end
++
+ return M
+diff --git a/plugin/tai.lua b/plugin/tai.lua
+index abf8172..7ff9710 100644
+--- a/plugin/tai.lua
++++ b/plugin/tai.lua
+@@ -6,18 +6,6 @@ local tai = require("tai")
+ -- Setup the plugin with default/user config
+ tai.setup({})
+ 
+--- Register global functions for operatorfunc mappings (if needed)
+--- These can be used with vim.keymap.set for operator-pending mode
+-_G.tai_operator_send = function(type)
+-	vim.cmd('set operatorfunc=v:lua.tai_operator_send')
+-	vim.api.nvim_feedkeys("g@", "n", false)
+-end
+-
+-_G.tai_operator_send_with_prompt = function(type)
+-	vim.cmd('set operatorfunc=v:lua.tai_operator_send_with_prompt')
+-	vim.api.nvim_feedkeys("g@", "n", false)
+-end
+-
+ -- Register vim commands
+ vim.api.nvim_create_user_command("Tai", function(args)
+ 	if args.args == "chat" then
+diff --git a/www/index.html b/www/index.html
+index 207b742..113e438 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -97,6 +97,23 @@ AI coding agents directly to your editor.
+ &amp;lt;leader&amp;gt;ts  - stop
+ &amp;lt;C-W&amp;gt;&amp;lt;C-T&amp;gt; - toggle chat window
+ 
++visual selection, or the key plus a motion
++&amp;lt;leader&amp;gt;tv  - send the selection
++gP           - type an instruction, then send it
++               with the selection
++
++insert mode. map &amp;lt;C-X&amp;gt; itself, then:
++&amp;lt;C-X&amp;gt;&amp;lt;C-T&amp;gt; - complete at the cursor
++&amp;lt;C-X&amp;gt;&amp;lt;C-A&amp;gt; - type an instruction, insert the
++               reply at the cursor
++other &amp;lt;C-X&amp;gt; keys stay the usual completion
++
++each of those uses its own system prompt.
++they do not enter the planner.
++a selection is answered in the chat.
++the insert-mode replies are placed at the cursor.
++put the maps in init.lua, with the others.
++
+ 
+ &lt;b&gt;installation&lt;/b&gt;
+ 
+@@ -114,6 +131,30 @@ For :Tai commands, also install &lt;i&gt;plugin/tai.lua&lt;/i&gt;.
+   vim.keymap.set("n", "&amp;lt;C-W&amp;gt;&amp;lt;C-T&amp;gt;",
+     tai.toggle_chat_window)
+ 
++  _G.tai_operator_send = tai.operator_send
++  _G.tai_operator_send_with_prompt =
++    tai.operator_send_with_prompt
++
++  vim.keymap.set("n", "&amp;lt;leader&amp;gt;tv", function()
++    vim.cmd("set operatorfunc=v:lua.tai_operator_send")
++    vim.api.nvim_feedkeys("g@", "n", false)
++  end, { noremap = true })
++  vim.keymap.set("x", "&amp;lt;leader&amp;gt;tv", function()
++    tai.visual_send()
++  end, { noremap = true })
++
++  vim.keymap.set("n", "gP", function()
++    vim.cmd("set operatorfunc=v:lua.tai_operator_send_with_prompt")
++    vim.api.nvim_feedkeys("g@", "n", false)
++  end, { noremap = true })
++  vim.keymap.set("x", "gP", function()
++    tai.visual_prompt()
++  end, { noremap = true })
++
++  vim.keymap.set({ "i" }, "&amp;lt;C-X&amp;gt;", function()
++    return tai.ctrl_x()
++  end, { expr = true, noremap = true })
++
+ requires Neovim 0.10+, a project &lt;i&gt;.tai&lt;/i&gt; file, and
+ an API key. or use lazy.nvim / packer / vim-plug.
+ 
+</pre>
