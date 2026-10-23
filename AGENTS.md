@@ -9,6 +9,7 @@ These notes are intended for **automated coding agents** working in this reposit
 
 - `lua/tai/` — Neovim plugin implementation (all core logic)
   - `init.lua` — plugin entrypoint (`setup`, `chat`, `stop`, …); connects MCPs
+  - `inline.lua` — visual selection, insert complete, and insert-at-cursor (own prompts, no planner)
   - `config.lua` — defaults + `.tai` project config (`mcps`, …)
   - `agent.lua` — main/subtask system prompts, `new_frame`, tool allowlists
   - `mcp.lua` — MCP client (stdio + HTTP); status/connect/call
@@ -93,6 +94,13 @@ it does not see the user's chat; its final text is the step response.
 
 - **Change system prompts**
   - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`).
+  - Inline editor actions: `lua/tai/inline.lua`.
+
+- **Inline editor actions**
+  - Keymaps live in the user's Neovim `init.lua`. The plugin does not bind keys.
+  - `<leader>tv` sends a visual selection or a motion. `gP` asks for an instruction first.
+  - Map `<C-X>` to `tai.ctrl_x` (`expr`). `<C-T>` completes at the cursor. `<C-A>` asks, then inserts the reply. Other `<C-X>` keys stay normal completion.
+  - These calls set `no_tools` and `stateless` and do not enter planner history.
 
 - **Provider-side tools (e.g. web_search)**
   - `.tai` field `provider_tools`.

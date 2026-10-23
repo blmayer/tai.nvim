@@ -32,6 +32,10 @@ local hard_stop = false
 local pending_tools = nil
 local current_job = nil
 local current_state = "idle" -- idle | waiting | throttled | thinking | tools
+local inline_busy = false
+local inline_epoch = 0
+-- True while an inline request owns current_state. Stop must not clear a planner request.
+local inline_state = false
 
 local function top()
 	return stack[#stack]
@@ -222,8 +226,11 @@ end
 
 providers_factory.on_throttle = function()
 	vim.schedule(function()
-		current_state = "throttled"
-		update_input_name()
+		-- A late notice must not overwrite idle, thinking, or tools.
+		if current_state == "waiting" or inline_busy then
+			current_state = "throttled"
+			update_input_name()
+		end
 	end)
 end
 
@@ -896,6 +903,10 @@ local function run_tools(tool_calls, frame, start_index, on_done)
 end
 
 function M.send_input()
+	if inline_busy then
+		vim.notify("tai: wait for the inline request to finish", vim.log.levels.WARN)
+		return
+	end
 	if hard_stop then
 		hard_stop = false
 	end
@@ -985,6 +996,16 @@ end
 
 function M.stop()
 	hard_stop = true
+	if inline_state then
+		inline_epoch = inline_epoch + 1
+		inline_busy = false
+		inline_state = false
+		if current_state == "waiting" or current_state == "throttled" then
+			current_state = "idle"
+			update_input_name()
+			M.update_chat_name()
+		end
+	end
 	if current_job then
 		pcall(vim.fn.jobstop, current_job)
 		current_job = nil
@@ -995,7 +1016,9 @@ function M.stop()
 	M.append("\n[tai] Stopped by user\n")
 end
 
-function M.open()
+function M.open(opts)
+	opts = opts or {}
+	local restore_win = opts.restore_win
 	vim.schedule(function()
 		local chat_window_nr = vim.fn.bufwinnr(M.buffer_nr)
 		if chat_window_nr == -1 then
@@ -1020,6 +1043,9 @@ function M.open()
 			if input_window_nr ~= -1 then
 				input_win = vim.fn.win_getid(input_window_nr)
 			end
+		end
+		if restore_win and vim.api.nvim_win_is_valid(restore_win) then
+			pcall(vim.api.nvim_set_current_win, restore_win)
 		end
 	end)
 end
@@ -1225,6 +1251,102 @@ function M.continue()
 			end)
 		end)
 	end
+end
+
+local function finish_inline(epoch)
+	if epoch ~= inline_epoch then
+		return false
+	end
+	inline_epoch = inline_epoch + 1
+	inline_busy = false
+	inline_state = false
+	if current_state == "waiting" or current_state == "throttled" then
+		current_state = "idle"
+		update_input_name()
+		M.update_chat_name()
+	end
+	return true
+end
+
+-- One model call with no tools and no planner history.
+-- kind is "complete", "insert", "selection", or "selection_prompt".
+function M.inline_request(messages, kind, callback)
+	callback = callback or function() end
+	if inline_busy or current_state ~= "idle" then
+		callback(nil, "busy")
+		return
+	end
+	if type(messages) ~= "table" or #messages == 0 then
+		callback(nil, "empty request")
+		return
+	end
+	inline_epoch = inline_epoch + 1
+	local epoch = inline_epoch
+	inline_busy = true
+	inline_state = true
+	current_state = "waiting"
+	update_input_name()
+	M.update_chat_name()
+
+	local cfg = vim.deepcopy(config)
+	cfg.no_tools = true
+	cfg.stateless = true
+	cfg.tool_choice = nil
+	cfg.tools = nil
+	local options = {}
+	if type(cfg.options) == "table" then
+		for k, v in pairs(cfg.options) do
+			options[k] = v
+		end
+	end
+	if options.max_tokens == nil and options.max_completion_tokens == nil then
+		options.max_tokens = (kind == "complete") and 400 or 2048
+	end
+	cfg.options = options
+
+	local function done(text, err)
+		vim.schedule(function()
+			if not finish_inline(epoch) then
+				return
+			end
+			callback(text, err)
+		end)
+	end
+
+	local ok, err = pcall(function()
+		provider.request(cfg, messages, function(fields, req_err)
+			if req_err then
+				done(nil, req_err)
+				return
+			end
+			local text = ""
+			if type(fields) == "table" and type(fields.content) == "string" then
+				text = fields.content
+			end
+			done(text, nil)
+		end)
+	end)
+	if not ok then
+		done(nil, err)
+	end
+end
+
+-- Show a selection exchange in the chat buffer. Does not touch planner history.
+function M.show_exchange(label, preview, reply)
+	if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
+		M.init()
+	end
+	local prev = vim.api.nvim_get_current_win()
+	add_sep("___ " .. (label or "TAI") .. " ")
+	if preview and preview ~= "" then
+		M.append(preview .. "\n")
+	end
+	add_sep("___ TAI ")
+	if reply and reply ~= "" then
+		M.append(reply .. "\n")
+	end
+	M.open({ restore_win = prev })
+	scroll_down()
 end
 
 return M

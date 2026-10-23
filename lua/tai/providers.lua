@@ -224,18 +224,24 @@ local function create_provider_module(provider_name)
 
 	local M_module = {}
 
+	-- Inline editor actions set no_tools so a completion cannot call the planner.
+	local function tools_enabled(model_config)
+		return config.use_tools ~= false and not (model_config and model_config.no_tools)
+	end
+
 	-- Build request body based on provider configuration
 	local function build_body(model_config, msgs)
 		-- Keep connected files up to date in history before sending
-		local agent_tools = common.build_request_tools(provider_config.api_format, model_config.tools)
-
 		local body = {
 			model = model_config.model,
 			messages = common.filter_messages(msgs),
 		}
 
-		if config.use_tools ~= false and #agent_tools > 0 then
-			body.tools = agent_tools
+		if tools_enabled(model_config) then
+			local agent_tools = common.build_request_tools(provider_config.api_format, model_config.tools)
+			if #agent_tools > 0 then
+				body.tools = agent_tools
+			end
 		end
 
 		if model_config.think ~= nil then
@@ -327,12 +333,19 @@ local function create_provider_module(provider_name)
 				M_module.request(model_config, msgs, callback)
 			end
 
-			for _, msg in ipairs(msgs) do
-				add_history_message(vim.deepcopy(msg))
+			-- A stateless call (inline complete / selection) must not join the chat history.
+			local source
+			if model_config.stateless then
+				source = msgs
+			else
+				for _, msg in ipairs(msgs) do
+					add_history_message(vim.deepcopy(msg))
+				end
+				source = history or {}
 			end
 
 			local input = {}
-			for _, msg in ipairs(history or {}) do
+			for _, msg in ipairs(source) do
 				local new_msg = {}
 				for k, v in pairs(msg) do
 					if k ~= "file_path" and k ~= "file_range" then
@@ -352,7 +365,7 @@ local function create_provider_module(provider_name)
 				store = false,
 			}
 
-			if config.use_tools ~= false then
+			if tools_enabled(model_config) then
 				body.tools = common.build_request_tools("responses", model_config.tools)
 			end
 
@@ -492,7 +505,7 @@ local function create_provider_module(provider_name)
 				stream = true,
 			}
 
-			if config.use_tools ~= false then
+			if tools_enabled(model_config) then
 				body.tools = common.build_request_tools("responses", model_config.tools)
 			end
 
@@ -652,8 +665,14 @@ local function create_provider_module(provider_name)
 		messages = common.filter_messages(msgs),
 	}
 
-	if config.use_tools ~= false then
+	if tools_enabled(model_config) then
 		body.tools = common.build_request_tools(provider_config.api_format, model_config.tools)
+	end
+
+	-- llama-server only parses Gemma's <|\"|> calls when a tool call is required.
+	-- Otherwise the native call is left in message content and never runs.
+	if model_config.tool_choice and body.tools and #body.tools > 0 then
+		body.tool_choice = model_config.tool_choice
 	end
 
 	if model_config.think ~= nil then

@@ -97,6 +97,23 @@ AI coding agents directly to your editor.
 &lt;leader&gt;ts  - stop
 &lt;C-W&gt;&lt;C-T&gt; - toggle chat window
 
+visual selection, or the key plus a motion
+&lt;leader&gt;tv  - send the selection
+gP           - type an instruction, then send it
+               with the selection
+
+insert mode. map &lt;C-X&gt; itself, then:
+&lt;C-X&gt;&lt;C-T&gt; - complete at the cursor
+&lt;C-X&gt;&lt;C-A&gt; - type an instruction, insert the
+               reply at the cursor
+other &lt;C-X&gt; keys stay the usual completion
+
+each of those uses its own system prompt.
+they do not enter the planner.
+a selection is answered in the chat.
+the insert-mode replies are placed at the cursor.
+put the maps in init.lua, with the others.
+
 
 <b>installation</b>
 
@@ -113,6 +130,30 @@ For :Tai commands, also install <i>plugin/tai.lua</i>.
   vim.keymap.set("n", "&lt;leader&gt;ts", tai.stop)
   vim.keymap.set("n", "&lt;C-W&gt;&lt;C-T&gt;",
     tai.toggle_chat_window)
+
+  _G.tai_operator_send = tai.operator_send
+  _G.tai_operator_send_with_prompt =
+    tai.operator_send_with_prompt
+
+  vim.keymap.set("n", "&lt;leader&gt;tv", function()
+    vim.cmd("set operatorfunc=v:lua.tai_operator_send")
+    vim.api.nvim_feedkeys("g@", "n", false)
+  end, { noremap = true })
+  vim.keymap.set("x", "&lt;leader&gt;tv", function()
+    tai.visual_send()
+  end, { noremap = true })
+
+  vim.keymap.set("n", "gP", function()
+    vim.cmd("set operatorfunc=v:lua.tai_operator_send_with_prompt")
+    vim.api.nvim_feedkeys("g@", "n", false)
+  end, { noremap = true })
+  vim.keymap.set("x", "gP", function()
+    tai.visual_prompt()
+  end, { noremap = true })
+
+  vim.keymap.set({ "i" }, "&lt;C-X&gt;", function()
+    return tai.ctrl_x()
+  end, { expr = true, noremap = true })
 
 requires Neovim 0.10+, a project <i>.tai</i> file, and
 an API key. or use lazy.nvim / packer / vim-plug.
