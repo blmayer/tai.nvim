@@ -190,4 +190,57 @@ end
 
 M.is_binary_file = is_binary_file
 
+function M.write(file, content)
+	log.debug("Running write_file for: " .. file)
+	if file:sub(1, 1) == "/" then
+		return "Paths cannot start from root (/). Use relative."
+	end
+	local dir = vim.fn.fnamemodify(file, ":p:h")
+	if dir and dir ~= "" and dir ~= "." and vim.fn.isdirectory(dir) == 0 then
+		if vim.fn.mkdir(dir, "p") == -1 then
+			return "[sys] Error: Could not create directory: " .. dir
+		end
+	end
+	local f = io.open(file, "w")
+	if not f then
+		return "Error: Could not open file for writing: " .. file
+	end
+	f:write(content)
+	f:close()
+	return "File created: " .. file
+end
+
+function M.image_data_url(image_path)
+	if vim.fn.filereadable(image_path) ~= 1 then
+		return nil, "Image file not found: " .. image_path
+	end
+	local ext = image_path:match("%.(%w+)$")
+	if not ext then
+		return nil, "File has no extension, cannot determine image type"
+	end
+	local mime_types = {
+		png = "image/png",
+		jpg = "image/jpeg",
+		jpeg = "image/jpeg",
+		gif = "image/gif",
+		webp = "image/webp",
+		bmp = "image/bmp",
+	}
+	local mime = mime_types[ext:lower()]
+	if not mime then
+		return nil, "Unsupported image format: " .. ext
+	end
+	local cmd = string.format("base64 -i '%s' | tr -d '\n'", image_path:gsub("'", "'\\''"))
+	local handle = io.popen(cmd, "r")
+	if not handle then
+		return nil, "Failed to read image file"
+	end
+	local base64_content = handle:read("*a")
+	handle:close()
+	if not base64_content or #base64_content == 0 then
+		return nil, "Failed to encode image to base64"
+	end
+	return "data:" .. mime .. ";base64," .. base64_content, nil
+end
+
 return M

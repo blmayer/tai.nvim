@@ -23,40 +23,23 @@ AI coding agents directly to your editor.
 
 <b>features</b>
 
-- subtask harness: main agent can implement or
-  spawn children with clean history; only the
-  final report (+ notes/todos) returns.
-- live context: per-agent notes + todos injected
-  into the system prompt every turn (not history).
-- flexible subtasks: goal, tools, optional
-  system_prompt and notes/todos seed.
+- one chat agent: it reads, edits, and runs
+  commands, then replies in the same chat.
+- notes: a short pad injected into the system
+  prompt every turn (not history).
 - session persistence: auto-save/restore.
 - file read/write, shell, image analysis.
 - rate limiting (rpm/tpm).
 - streaming and non-streaming modes.
-- code folding (including whole subtasks).
+- code folding for tool output.
 - provider-side tool pass-through.
 - configurable shell command safety allowlist.
 
 
-<b>harness</b>
+<b>chat</b>
 
-  MAIN (edit/write + subtask)
-    │
-    ├── subtask(goal, tools, system_prompt?)
-    │      {{{ fold, own history + notes
-    │      final text reply
-    │   ◄── summary + notes + todos
-    │
-    └── verify → answer user
-
-
-<subtask params>
-
-- goal           required charter for the child
-- tools          required tool allowlist
-- system_prompt  optional persona/constraints
-- notes, todos   optional seed memory
+one agent. the conversation is the history.
+it uses tools, then answers in text.
 
 
 <i>providers</i>
@@ -84,9 +67,9 @@ AI coding agents directly to your editor.
 - edit       search-and-replace (multi flag)
 - write      create new files
 - send_image send images for visual analysis
-- subtask    spawn child agent (goal + tools)
-- todos      add/update todos (auto-injected)
-- notes      write/append shared notes (injected every turn)
+- notes      write/append a short pad (injected every turn)
+- skill      list, load, or unload a skill
+- mcp        status, connect, or call an MCP tool
 
 
 <b>keybindings</b>

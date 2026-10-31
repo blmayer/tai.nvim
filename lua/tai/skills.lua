@@ -11,8 +11,8 @@
 ---       description: 1–1024 chars; non-empty; what it does and when to use it
 ---
 --- Progressive disclosure:
----   1. Catalog (name + description) injected at startup for all valid skills
----   2. Full SKILL.md body injected when a skill is loaded via the skill tool
+---   1. Name and description are a system message
+---   2. Full SKILL.md body is a system message after the skill is loaded
 ---   3. scripts/ / references/ / assets/ are left on disk for on-demand reads
 ---
 --- Optional frontmatter (parsed but not required): license, compatibility,
@@ -356,41 +356,30 @@ end
 
 -- Rendering --
 
---- Compact catalog for the system prompt (progressive disclosure step 1).
---- Only name + description — never the full body.
-function M.render_catalog()
+--- Name and description list. Empty when no skills exist. Its own system message.
+function M.catalog_text()
 	if #M.order == 0 then
 		return ""
 	end
-	local lines = {
-		"## Available Skills",
-		"",
-		"Skills follow the Agent Skills format (name + description below). "
-			.. "Use the `skill` tool with action `load` and the skill name when relevant; "
-			.. "that injects the full skill instructions into context.",
-		"",
-	}
+	local lines = { "Available skills. Load one with the skill tool.", "" }
 	for _, id in ipairs(M.order) do
 		local s = M.registry[id]
 		local status = s.loaded and " [loaded]" or ""
-		table.insert(lines, string.format("- **%s**: %s%s", s.name, s.desc, status))
+		table.insert(lines, "- " .. s.name .. ": " .. s.desc .. status)
 	end
 	return table.concat(lines, "\n")
 end
 
---- Full markdown body of all loaded skills (progressive disclosure step 2).
-function M.render_loaded()
-	local parts = {}
+--- One string per loaded skill. Each becomes its own system message.
+function M.loaded_texts()
+	local out = {}
 	for _, id in ipairs(M.order) do
 		local s = M.registry[id]
-		if s.loaded and s.content then
-			table.insert(parts, "### Skill: " .. s.name .. "\n\n" .. s.content)
+		if s.loaded and s.content and s.content ~= "" then
+			table.insert(out, "Skill: " .. s.name .. "\n\n" .. s.content)
 		end
 	end
-	if #parts == 0 then
-		return ""
-	end
-	return table.concat(parts, "\n\n---\n\n")
+	return out
 end
 
 --- List skills for the tool response.

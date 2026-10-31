@@ -818,7 +818,6 @@ function M.render_prompt_section()
 	table.sort(names)
 	local lines = {
 		"## MCP Servers",
-		"Use the `mcp` tool to check status, connect/disconnect, or call server tools.",
 	}
 	for _, n in ipairs(names) do
 		local s = servers[n]
@@ -834,6 +833,34 @@ function M.render_prompt_section()
 		))
 	end
 	return table.concat(lines, "\n")
+end
+
+--- One string per connected server. Each becomes its own system message.
+function M.server_texts()
+	local names = {}
+	for n, s in pairs(servers) do
+		if s.status == "connected" then
+			table.insert(names, n)
+		end
+	end
+	table.sort(names)
+	local out = {}
+	for _, n in ipairs(names) do
+		local s = servers[n]
+		local tool_bits = {}
+		for _, t in ipairs(s.tools or {}) do
+			table.insert(tool_bits, t.name)
+		end
+		local text = "MCP: " .. s.name
+		if #tool_bits > 0 then
+			text = text .. "\ntools: " .. table.concat(tool_bits, ", ")
+		end
+		if #out == 0 then
+			text = "Use the mcp tool to check status, connect or disconnect, or call a server tool.\n\n" .. text
+		end
+		table.insert(out, text)
+	end
+	return out
 end
 
 -- Cached tool schemas (set via update_tool_def from init); avoids mid-call requires.

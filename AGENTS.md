@@ -11,13 +11,13 @@ These notes are intended for **automated coding agents** working in this reposit
   - `init.lua` — plugin entrypoint (`setup`, `chat`, `stop`, …); connects MCPs
   - `inline.lua` — visual selection, insert complete, and insert-at-cursor (own prompts, no planner)
   - `config.lua` — defaults + `.tai` project config (`mcps`, …)
-  - `agent.lua` — main/subtask system prompts, `new_frame`, tool allowlists
+  - `agent.lua` — chat system prompt, `new_frame`, tool allowlists
   - `mcp.lua` — MCP client (stdio + HTTP); status/connect/call
   - `providers.lua` / `provider_common.lua` — provider adapters
   - `tools.lua` — tool **schemas** + re-exports
-  - `tools/` — implementation modules (`io`, `shell`, `edit`, `subtask`, `skill`, `mcp`)
+  - `tools/` — implementation modules (`io`, `shell`, `edit`, `notes`, `skill`, `mcp`)
   - `ui.lua` — thin facade over `ui/core.lua`
-  - `ui/core.lua` — stack, continue loop, tool runner, chat UI
+  - `ui/core.lua` — chat loop, tool runner, chat UI
   - `context.lua` — session file load/save
   - `log.lua` — logging
 - `plugin/tai.lua` — optional autoload + `:Tai` user command
@@ -25,35 +25,24 @@ These notes are intended for **automated coding agents** working in this reposit
 - `README.md` — user documentation
 - `TODO.md` — rough roadmap / scratchpad
 
-## Agent harness (runtime)
+## Chat (runtime)
+
+One agent. `stack[1]` is the chat. Its history is the conversation.
 
 ```
-stack[1] = MAIN frame (history + goal + steps; multi-turn; tool: subtask)
-stack[2+] = isolated SUBTASK (history = goal only; steps in system prompt)
-
-each frame.steps = completed sibling steps at that level
-  { text = child goal, response = child outcome }
-
-each request (ephemeral):
-  system = base_prompt
-         + granted / grantable tools
-         + NOTES (shared pad)
-         + LIVE CONTEXT (previous steps at this level; isolated only)
-         + MCP Servers state
-
-answer if the goal is fully addressed, else subtask one step.
-notes is the shared channel between agents.
-when a child returns, the parent is asked again.
-it does not see the user's chat; its final text is the step response.
+each request (ephemeral, not stored in history):
+  system 1 = chat prompt
+  system 2 = notes, when the pad is not empty
+  system   = available skills, when any exist
+  system   = one message per loaded skill
+  system   = one message per connected MCP server
+  then the chat history
 ```
 
-- Main tools: `subtask`, `notes`
-- Child tools: those listed in `subtask.tools` (default: `subtask`, `notes`)
-- Pass read/shell/edit for a one-shot leaf. Omit `tools` to make a coordinator.
-- `run_tools` rejects names not on the frame allowlist (models can still hallucinate tools).
-- Notes are global (one pad for the stack) and injected every turn for main and workers
-- `notes` does not end a worker (briefing); work tools still end a leaf
-- Isolated workers see sibling step reports via Live Context, not chat history
+- Chat tools: `read`, `shell`, `edit`, `write`, `send_image`, `notes`, `skill`, `mcp`. No `subtask`.
+- The agent uses tools, then replies in text. A reply with no tool call ends the turn.
+- `run_tools` rejects names not on the frame allowlist.
+- Notes, loaded skills, and connected MCP servers are separate system messages. They are not written into history.
 - Skills (Agent Skills spec): dirs under `~/.config/tai/skills/` and `<project>/.tai-skills/`, each with `SKILL.md`
   - Required frontmatter: `name` (1–64, `[a-z0-9-]+`, match dir name) + `description` (1–1024, non-empty)
   - Invalid skills are skipped; catalog = name+description; `skill` load injects markdown body only
@@ -89,11 +78,11 @@ it does not see the user's chat; its final text is the step response.
   - Schema in `lua/tai/tools.lua`.
   - Implementation under `lua/tai/tools/` (or inline).
   - Wire in `ui/core.lua` `run_tools`.
-  - Update allowlists in `agent.lua` if subtasks may use it.
+  - Update `agent.main_tools` in `agent.lua` if the chat agent may use it.
   - Update README / www.
 
 - **Change system prompts**
-  - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`).
+  - `lua/tai/agent.lua` (`system_prompt`).
   - Inline editor actions: `lua/tai/inline.lua`.
 
 - **Inline editor actions**

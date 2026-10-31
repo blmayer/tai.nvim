@@ -2,9 +2,8 @@
 
 ![tai.nvim in action](www/screenshot.png)
 
-> A minimal, dependency-free Neovim plugin that brings AI coding agents directly
-> into your editor. It uses a **subtask harness**, Live Context (goal + previous
-> steps), session persistence, and many LLM providers.
+> A minimal, dependency-free Neovim plugin that brings one AI coding assistant
+> into your editor. It chats, uses tools, and keeps the session.
 
 <a href="https://dotfyle.com/plugins/blmayer/tai">
 	<img src="https://dotfyle.com/plugins/blmayer/tai/shield?style=flat" />
@@ -12,79 +11,22 @@
 
 ## Features
 
-- **Subtask harness** — if you can answer, do it; else `subtask` until you
-  can. Children start with a clean history and iterate only after a
-  subtask returns. Their final text is the result.
-- **Current state** — Goal + Previous steps at this level, shown as data
-  (not mixed into the instructions).
-- **Flexible subtasks** — pass `goal`, optional `tools` / `system_prompt`.
+- **One chat agent** — it reads, edits, and runs commands, then replies in
+  the same conversation.
+- **Notes** — a short pad injected into the system prompt each turn.
 - **Session persistence** — conversations auto-save/restore (`.tai-session.json`
   in the project root).
-- **Tool use** — read/write files, shell, edit, images, subtask, MCP.
+- **Tool use** — read/write files, shell, edit, images, MCP.
 - **MCP** — local stdio and remote HTTP servers from `.tai` (`mcps`).
 - **Rate limiting** — configurable `rpm` / `tpm`.
 - **Streaming and non-streaming** for all providers.
-- **Code folding** — tool output and whole subtasks fold in the chat buffer.
+- **Code folding** — tool output folds in the chat buffer.
 - **Provider-side tools** — pass-through for e.g. `web_search`.
 - **Configurable shell safety** — allowlist of commands without confirmation.
 
-## Agent harness
+## Chat
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  MAIN (multi-turn, subtask + notes)                          │
-│  Live Context: shared notes                                  │
-│                                                              │
-│   reply if done, else subtask(one concrete next step)        │
-│        │                                                     │
-│        ▼                                                     │
-│   ┌──────────────────────────────────────────────────────┐   │
-│   │  SUBTASK (clean history)  fold                       │   │
-│   │  Goal + Previous steps at this level                 │   │
-│   │  work, or subtask, then next step or reply           │   │
-│   └──────────────────────┬───────────────────────────────┘   │
-│                          │ step recorded as previous step    │
-│                          ▼                                   │
-│   next subtask, or answer the user                           │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Rules of the harness:**
-
-1. No `todos` tool. Agents **answer** or call **`subtask`** (one step).
-2. Answer only if it fully addresses the goal. A subtask is one step
-   toward that goal.
-3. When a child returns, its report is injected into the parent’s system
-   prompt and the parent is asked again. The child’s final text is the result.
-4. Max depth is 8. A child may nest only if granted `subtask`. Pass a
-   `read`/`shell`/`edit` for a leaf; omit `tools` for a coordinator.
-   Ungranted tools are denied.
-5. Main is the orchestrator (`subtask` + shared `notes`). Work happens in subagents.
-
-### Subtask tool parameters
-
-| Field | Required | Description |
-|---|---|---|
-| `goal` | yes | The next step (paths, action). Must not copy the current Goal |
-| `tools` | no | Child tools. Default is `subtask` + `notes`. Pass `read`/`shell`/`edit` for a leaf. |
-| `system_prompt` | no | Override the default worker prompt |
-
-Examples:
-
-```json
-{
-  "goal": "List lua/tai and report which file defines main_tools.",
-  "tools": ["read", "shell"]
-}
-```
-
-```json
-{
-  "goal": "In lua/tai/agent.lua, change main_tools to only subtask. Minimal diff.",
-  "tools": ["read", "edit"],
-  "system_prompt": "You are a careful implementer. Do not freestyle architecture."
-}
-```
+One agent. The conversation is the history. It uses tools, then answers in text.
 
 ## Providers
 
@@ -261,12 +203,11 @@ Example `.tai` file:
 | `send_image` | Send images for visual analysis |
 | `edit` | Search-and-replace edit (`multi` flag supported) |
 | `write` | Create new files |
-| `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
-| `notes` | Write/append the shared notepad (injected every turn for main and workers) |
+| `notes` | Write/append a short pad (injected every turn) |
+| `skill` | List, load, or unload Agent Skills |
 | `mcp` | MCP status / connect / disconnect / list_tools / call |
 
-Main and default children get `subtask` + `notes`. Pass `read`/`shell`/`edit`
-in `tools` for a one-shot leaf.
+The chat agent has these tools. It does the work in the same conversation.
 
 ### `mcp` tool
 
@@ -293,7 +234,7 @@ If `plugin/tai.lua` is on the runtimepath:
 
 ```sh
 nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/edit_test.lua" -c "qa!"
-nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/subtask_test.lua" -c "qa!"
+nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/chat_test.lua" -c "qa!"
 nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/mcp_test.lua" -c "qa!"
 ```
 
