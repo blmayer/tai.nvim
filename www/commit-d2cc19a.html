@@ -1,0 +1,2390 @@
+<!DOCTYPE html>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tai.nvim d2cc19a</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>tai.nvim</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit d2cc19a
+parent <a href=commit-276945b.html>276945b</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-10-31T11:19:53-03:00
+
+    Make chat one agent and split context into system messages.
+
+    The chat agent does the work itself. Subtask nesting is gone. Notes, the skill list, each loaded skill, and each connected MCP server are separate system messages, and the prompt keeps only the lines that change the work.
+
+<a href=tree-d2cc19a.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index c4d0c4e..42f96ff 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -11,13 +11,13 @@ These notes are intended for **automated coding agents** working in this reposit
+   - `init.lua` — plugin entrypoint (`setup`, `chat`, `stop`, …); connects MCPs
+   - `inline.lua` — visual selection, insert complete, and insert-at-cursor (own prompts, no planner)
+   - `config.lua` — defaults + `.tai` project config (`mcps`, …)
+-  - `agent.lua` — main/subtask system prompts, `new_frame`, tool allowlists
++  - `agent.lua` — chat system prompt, `new_frame`, tool allowlists
+   - `mcp.lua` — MCP client (stdio + HTTP); status/connect/call
+   - `providers.lua` / `provider_common.lua` — provider adapters
+   - `tools.lua` — tool **schemas** + re-exports
+-  - `tools/` — implementation modules (`io`, `shell`, `edit`, `subtask`, `skill`, `mcp`)
++  - `tools/` — implementation modules (`io`, `shell`, `edit`, `notes`, `skill`, `mcp`)
+   - `ui.lua` — thin facade over `ui/core.lua`
+-  - `ui/core.lua` — stack, continue loop, tool runner, chat UI
++  - `ui/core.lua` — chat loop, tool runner, chat UI
+   - `context.lua` — session file load/save
+   - `log.lua` — logging
+ - `plugin/tai.lua` — optional autoload + `:Tai` user command
+@@ -25,35 +25,24 @@ These notes are intended for **automated coding agents** working in this reposit
+ - `README.md` — user documentation
+ - `TODO.md` — rough roadmap / scratchpad
+ 
+-## Agent harness (runtime)
++## Chat (runtime)
++
++One agent. `stack[1]` is the chat. Its history is the conversation.
+ 
+ ```
+-stack[1] = MAIN frame (history + goal + steps; multi-turn; tool: subtask)
+-stack[2+] = isolated SUBTASK (history = goal only; steps in system prompt)
+-
+-each frame.steps = completed sibling steps at that level
+-  { text = child goal, response = child outcome }
+-
+-each request (ephemeral):
+-  system = base_prompt
+-         + granted / grantable tools
+-         + NOTES (shared pad)
+-         + LIVE CONTEXT (previous steps at this level; isolated only)
+-         + MCP Servers state
+-
+-answer if the goal is fully addressed, else subtask one step.
+-notes is the shared channel between agents.
+-when a child returns, the parent is asked again.
+-it does not see the user's chat; its final text is the step response.
++each request (ephemeral, not stored in history):
++  system 1 = chat prompt
++  system 2 = notes, when the pad is not empty
++  system   = available skills, when any exist
++  system   = one message per loaded skill
++  system   = one message per connected MCP server
++  then the chat history
+ ```
+ 
+-- Main tools: `subtask`, `notes`
+-- Child tools: those listed in `subtask.tools` (default: `subtask`, `notes`)
+-- Pass read/shell/edit for a one-shot leaf. Omit `tools` to make a coordinator.
+-- `run_tools` rejects names not on the frame allowlist (models can still hallucinate tools).
+-- Notes are global (one pad for the stack) and injected every turn for main and workers
+-- `notes` does not end a worker (briefing); work tools still end a leaf
+-- Isolated workers see sibling step reports via Live Context, not chat history
++- Chat tools: `read`, `shell`, `edit`, `write`, `send_image`, `notes`, `skill`, `mcp`. No `subtask`.
++- The agent uses tools, then replies in text. A reply with no tool call ends the turn.
++- `run_tools` rejects names not on the frame allowlist.
++- Notes, loaded skills, and connected MCP servers are separate system messages. They are not written into history.
+ - Skills (Agent Skills spec): dirs under `~/.config/tai/skills/` and `&lt;project&gt;/.tai-skills/`, each with `SKILL.md`
+   - Required frontmatter: `name` (1–64, `[a-z0-9-]+`, match dir name) + `description` (1–1024, non-empty)
+   - Invalid skills are skipped; catalog = name+description; `skill` load injects markdown body only
+@@ -89,11 +78,11 @@ it does not see the user's chat; its final text is the step response.
+   - Schema in `lua/tai/tools.lua`.
+   - Implementation under `lua/tai/tools/` (or inline).
+   - Wire in `ui/core.lua` `run_tools`.
+-  - Update allowlists in `agent.lua` if subtasks may use it.
++  - Update `agent.main_tools` in `agent.lua` if the chat agent may use it.
+   - Update README / www.
+ 
+ - **Change system prompts**
+-  - `lua/tai/agent.lua` (`system_prompt`, `subtask_system_prompt`).
++  - `lua/tai/agent.lua` (`system_prompt`).
+   - Inline editor actions: `lua/tai/inline.lua`.
+ 
+ - **Inline editor actions**
+diff --git a/README.md b/README.md
+index 27ffafc..495d1c3 100644
+--- a/README.md
++++ b/README.md
+@@ -2,9 +2,8 @@
+ 
+ ![tai.nvim in action](www/screenshot.png)
+ 
+-&gt; A minimal, dependency-free Neovim plugin that brings AI coding agents directly
+-&gt; into your editor. It uses a **subtask harness**, Live Context (goal + previous
+-&gt; steps), session persistence, and many LLM providers.
++&gt; A minimal, dependency-free Neovim plugin that brings one AI coding assistant
++&gt; into your editor. It chats, uses tools, and keeps the session.
+ 
+ &lt;a href="https://dotfyle.com/plugins/blmayer/tai"&gt;
+ 	&lt;img src="https://dotfyle.com/plugins/blmayer/tai/shield?style=flat" /&gt;
+@@ -12,79 +11,22 @@
+ 
+ ## Features
+ 
+-- **Subtask harness** — if you can answer, do it; else `subtask` until you
+-  can. Children start with a clean history and iterate only after a
+-  subtask returns. Their final text is the result.
+-- **Current state** — Goal + Previous steps at this level, shown as data
+-  (not mixed into the instructions).
+-- **Flexible subtasks** — pass `goal`, optional `tools` / `system_prompt`.
++- **One chat agent** — it reads, edits, and runs commands, then replies in
++  the same conversation.
++- **Notes** — a short pad injected into the system prompt each turn.
+ - **Session persistence** — conversations auto-save/restore (`.tai-session.json`
+   in the project root).
+-- **Tool use** — read/write files, shell, edit, images, subtask, MCP.
++- **Tool use** — read/write files, shell, edit, images, MCP.
+ - **MCP** — local stdio and remote HTTP servers from `.tai` (`mcps`).
+ - **Rate limiting** — configurable `rpm` / `tpm`.
+ - **Streaming and non-streaming** for all providers.
+-- **Code folding** — tool output and whole subtasks fold in the chat buffer.
++- **Code folding** — tool output folds in the chat buffer.
+ - **Provider-side tools** — pass-through for e.g. `web_search`.
+ - **Configurable shell safety** — allowlist of commands without confirmation.
+ 
+-## Agent harness
++## Chat
+ 
+-```
+-┌──────────────────────────────────────────────────────────────┐
+-│  MAIN (multi-turn, subtask + notes)                          │
+-│  Live Context: shared notes                                  │
+-│                                                              │
+-│   reply if done, else subtask(one concrete next step)        │
+-│        │                                                     │
+-│        ▼                                                     │
+-│   ┌──────────────────────────────────────────────────────┐   │
+-│   │  SUBTASK (clean history)  fold                       │   │
+-│   │  Goal + Previous steps at this level                 │   │
+-│   │  work, or subtask, then next step or reply           │   │
+-│   └──────────────────────┬───────────────────────────────┘   │
+-│                          │ step recorded as previous step    │
+-│                          ▼                                   │
+-│   next subtask, or answer the user                           │
+-└──────────────────────────────────────────────────────────────┘
+-```
+-
+-**Rules of the harness:**
+-
+-1. No `todos` tool. Agents **answer** or call **`subtask`** (one step).
+-2. Answer only if it fully addresses the goal. A subtask is one step
+-   toward that goal.
+-3. When a child returns, its report is injected into the parent’s system
+-   prompt and the parent is asked again. The child’s final text is the result.
+-4. Max depth is 8. A child may nest only if granted `subtask`. Pass a
+-   `read`/`shell`/`edit` for a leaf; omit `tools` for a coordinator.
+-   Ungranted tools are denied.
+-5. Main is the orchestrator (`subtask` + shared `notes`). Work happens in subagents.
+-
+-### Subtask tool parameters
+-
+-| Field | Required | Description |
+-|---|---|---|
+-| `goal` | yes | The next step (paths, action). Must not copy the current Goal |
+-| `tools` | no | Child tools. Default is `subtask` + `notes`. Pass `read`/`shell`/`edit` for a leaf. |
+-| `system_prompt` | no | Override the default worker prompt |
+-
+-Examples:
+-
+-```json
+-{
+-  "goal": "List lua/tai and report which file defines main_tools.",
+-  "tools": ["read", "shell"]
+-}
+-```
+-
+-```json
+-{
+-  "goal": "In lua/tai/agent.lua, change main_tools to only subtask. Minimal diff.",
+-  "tools": ["read", "edit"],
+-  "system_prompt": "You are a careful implementer. Do not freestyle architecture."
+-}
+-```
++One agent. The conversation is the history. It uses tools, then answers in text.
+ 
+ ## Providers
+ 
+@@ -261,12 +203,11 @@ Example `.tai` file:
+ | `send_image` | Send images for visual analysis |
+ | `edit` | Search-and-replace edit (`multi` flag supported) |
+ | `write` | Create new files |
+-| `subtask` | One-shot child for the next step (`goal`, optional `tools` / `system_prompt`) |
+-| `notes` | Write/append the shared notepad (injected every turn for main and workers) |
++| `notes` | Write/append a short pad (injected every turn) |
++| `skill` | List, load, or unload Agent Skills |
+ | `mcp` | MCP status / connect / disconnect / list_tools / call |
+ 
+-Main and default children get `subtask` + `notes`. Pass `read`/`shell`/`edit`
+-in `tools` for a one-shot leaf.
++The chat agent has these tools. It does the work in the same conversation.
+ 
+ ### `mcp` tool
+ 
+@@ -293,7 +234,7 @@ If `plugin/tai.lua` is on the runtimepath:
+ 
+ ```sh
+ nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/edit_test.lua" -c "qa!"
+-nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/subtask_test.lua" -c "qa!"
++nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/chat_test.lua" -c "qa!"
+ nvim --headless -u NONE -c "set rtp+=." -c "luafile lua/tai/tests/mcp_test.lua" -c "qa!"
+ ```
+ 
+diff --git a/lua/tai/agent.lua b/lua/tai/agent.lua
+index 48e08f7..7d6e431 100644
+--- a/lua/tai/agent.lua
++++ b/lua/tai/agent.lua
+@@ -1,87 +1,39 @@
+ local M = {}
+ 
+ local config = require("tai.config")
+-local skills = require("tai.skills")
+ 
+ if not config.root then
+ 	return M
+ end
+ 
+-M.MAX_DEPTH = 8
+-
+-local guide = [[
+-Coding guidelines
+-
+-- Do the work. Do not stop at a plan or a promise.
+-- Do not assume what exists. List the project, then open what you find.
+-- Decide only from tool results, notes, and previous steps. Never guess paths.
+-- NOTES is the only shared memory. Write short facts others need (paths, names, findings). No plans or dumps.
+-- A child starts empty: it sees only its goal, NOTES, and previous steps at its level.
+-- Put every path, name, and constraint in the child's goal. Write durable facts to notes before you spawn.
+-- Grep to search (use -A/-B). Do not read a whole file to search.
+-- Read only a range; edit needs the previous content, not line numbers.
+-- Be efficient. Completely address the goal. No markdown, use ASCII.
+-- Use only tools you may call. If you need a tool you cannot call, subtask and grant that tool to the child.
+-]]
+-
+ M.system_prompt = [[
+-You are the orchestrator for this project: ]] .. config.root .. [[
+-
+-You cannot read, edit, or run commands. Your agents do the work.
+-You only reply to the user or call subtask.
+-- A child starts empty. It cannot see this chat. Put every path, name, and constraint in the goal. Write durable facts to notes before you spawn.
+-- Answer only when the request is fully addressed from notes or step reports. Do not invent.
+-- Otherwise subtask one concrete next step. Grant the child the tools that step needs (read/shell/edit), even if you cannot call them.
+-- If that step still needs more than one shot, also grant subtask.
+-- Notes is shared. No markdown, use ASCII.
++You are Tai, one coding assistant in this chat.
+ 
++- Decide only from tool results and notes. Do not guess paths.
++- Grep to search (use -A/-B). Do not read a whole file to search.
++- Read a range. Edit needs the previous content, not line numbers.
++- Do the work. Do not stop at a plan or a promise.
++- When the request is done, reply in text.
+ ]]
+ 
+-M.subtask_system_prompt = [[
+-You are an agent for this project: ]] .. config.root .. [[
+-
+-Answer or call subtask:
+-- Do the goal. Answer only when it is fully done from notes, previous steps, or this turn.
+-- A child starts empty. Put every path, name, and constraint in its goal. Write durable facts to notes before you spawn.
+-- Use only tools you may call. Grant a child the tools it needs, even ones you cannot call.
+-- If you have read/shell/edit and the task is one shot, do the work. Do not subtask it.
+-- If the goal is simple but you cannot do it, say what is missing. Do not copy or rephrase it as a subtask.
+-- Otherwise subtask one smaller step. Give it the tools for that goal, not a copy of yours.
+-- If that step still needs more than one shot, also grant subtask.
+-
+-]] .. guide
+-
+ M.system_prompt = config.system_prompt or M.system_prompt
+ if config.custom_prompt and config.custom_prompt ~= "" then
+ 	M.system_prompt = M.system_prompt .. "\n" .. config.custom_prompt
+ end
+ 
+--- Append skill catalog (compact listing) so the model knows what's available.
+-local catalog = skills.render_catalog()
+-if catalog ~= "" then
+-	M.system_prompt = M.system_prompt .. "\n\n" .. catalog
+-end
+-
+ M.main_tools = {
+-	"subtask",
+-	"notes",
+-}
+-
+--- Names a child may be granted.
+-M.subtask_tools = {
+-	"read", "shell", "send_image", "edit", "write", "notes", "subtask", "skill", "mcp",
+-}
+-
+--- Default child is a coordinator, like main. Work tools only if the parent lists them.
+-M.default_child_tools = {
+-	"subtask",
++	"read",
++	"shell",
++	"edit",
++	"write",
++	"send_image",
+ 	"notes",
++	"skill",
++	"mcp",
+ }
+ 
+--- One-liners for the prompt. Schema text stays on the tool defs.
+ M.tool_blurb = {
+-	subtask = "spawn one smaller step; grant the child the tools that step needs",
+-	notes = "shared pad; write facts a child will need before you spawn",
++	notes = "pad for short facts you will need later",
+ 	read = "open a file or line range",
+ 	shell = "run a command in the project root",
+ 	edit = "replace text in a file",
+@@ -91,11 +43,6 @@ M.tool_blurb = {
+ 	mcp = "status/connect/call MCP tools",
+ }
+ 
+-local subtask_tool_set = {}
+-for _, name in ipairs(M.subtask_tools) do
+-	subtask_tool_set[name] = true
+-end
+-
+ function M.tool_granted(tools, name)
+ 	if type(name) ~= "string" or name == "" or type(tools) ~= "table" then
+ 		return false
+@@ -108,81 +55,28 @@ function M.tool_granted(tools, name)
+ 	return false
+ end
+ 
+-local function tool_line(name)
+-	local blurb = M.tool_blurb[name]
+-	if blurb then
+-		return "- " .. name .. ": " .. blurb
+-	end
+-	return "- " .. name
+-end
+-
+---- Compact catalog for the system prompt: granted tools, plus grantable
+---- names when this frame has `subtask`.
+ function M.render_tools(tools)
+ 	if type(tools) ~= "table" or #tools == 0 then
+ 		return ""
+ 	end
+ 	local lines = { "You may call only:" }
+-	local granted = {}
+ 	for _, name in ipairs(tools) do
+-		granted[name] = true
+-		table.insert(lines, tool_line(name))
+-	end
+-	if granted.subtask then
+-		table.insert(lines, "A child can be given any of these, including ones you cannot call:")
+-		for _, name in ipairs(M.subtask_tools) do
+-			table.insert(lines, tool_line(name))
++		local blurb = M.tool_blurb[name]
++		if blurb then
++			table.insert(lines, "- " .. name .. ": " .. blurb)
++		else
++			table.insert(lines, "- " .. name)
+ 		end
+ 	end
+ 	return table.concat(lines, "\n")
+ end
+ 
+--- Keep known names; if none survive, use the coordinator default.
+-function M.sanitize_subtask_tools(tools)
+-	local out = {}
+-	if type(tools) == "table" then
+-		for _, name in ipairs(tools) do
+-			if subtask_tool_set[name] then
+-				table.insert(out, name)
+-			end
+-		end
+-	end
+-	if #out == 0 then
+-		return vim.deepcopy(M.default_child_tools)
+-	end
+-	return out
+-end
+-
+---- Build a new agent frame.
+---- opts: profile ("main"|"subtask"), system_prompt?, tools?, goal?,
+----       steps?, depth?, parent_call_id?
+-function M.new_frame(opts)
+-	opts = opts or {}
+-
+-	local is_sub = opts.profile == "subtask"
+-	local system = opts.system_prompt
+-		or (is_sub and M.subtask_system_prompt or M.system_prompt)
+-
+-	local tool_list = is_sub
+-		and M.sanitize_subtask_tools(opts.tools)
+-		or (opts.tools or M.main_tools)
+-
+-	local frame = {
+-		label = is_sub and "SUBTASK" or "MAIN",
+-		system_prompt = system,
+-		tools = tool_list,
+-		history = { { role = "system", content = system } },
+-		goal = opts.goal,
+-		steps = vim.deepcopy(opts.steps or {}),
+-		isolated = is_sub,
+-		depth = opts.depth or 0,
+-		parent_call_id = opts.parent_call_id,
+-		tool_outputs = {},
++function M.new_frame()
++	return {
++		system_prompt = M.system_prompt,
++		tools = vim.deepcopy(M.main_tools),
++		history = { { role = "system", content = M.system_prompt } },
+ 	}
+-	if opts.goal and opts.goal ~= "" then
+-		table.insert(frame.history, { role = "user", content = opts.goal })
+-	end
+-	return frame
+ end
+ 
+ return M
+diff --git a/lua/tai/mcp.lua b/lua/tai/mcp.lua
+index 012449d..0712307 100644
+--- a/lua/tai/mcp.lua
++++ b/lua/tai/mcp.lua
+@@ -818,7 +818,6 @@ function M.render_prompt_section()
+ 	table.sort(names)
+ 	local lines = {
+ 		"## MCP Servers",
+-		"Use the `mcp` tool to check status, connect/disconnect, or call server tools.",
+ 	}
+ 	for _, n in ipairs(names) do
+ 		local s = servers[n]
+@@ -836,6 +835,34 @@ function M.render_prompt_section()
+ 	return table.concat(lines, "\n")
+ end
+ 
++--- One string per connected server. Each becomes its own system message.
++function M.server_texts()
++	local names = {}
++	for n, s in pairs(servers) do
++		if s.status == "connected" then
++			table.insert(names, n)
++		end
++	end
++	table.sort(names)
++	local out = {}
++	for _, n in ipairs(names) do
++		local s = servers[n]
++		local tool_bits = {}
++		for _, t in ipairs(s.tools or {}) do
++			table.insert(tool_bits, t.name)
++		end
++		local text = "MCP: " .. s.name
++		if #tool_bits &gt; 0 then
++			text = text .. "\ntools: " .. table.concat(tool_bits, ", ")
++		end
++		if #out == 0 then
++			text = "Use the mcp tool to check status, connect or disconnect, or call a server tool.\n\n" .. text
++		end
++		table.insert(out, text)
++	end
++	return out
++end
++
+ -- Cached tool schemas (set via update_tool_def from init); avoids mid-call requires.
+ local tool_defs = nil
+ 
+diff --git a/lua/tai/skills.lua b/lua/tai/skills.lua
+index 3807060..08fc252 100644
+--- a/lua/tai/skills.lua
++++ b/lua/tai/skills.lua
+@@ -11,8 +11,8 @@
+ ---       description: 1–1024 chars; non-empty; what it does and when to use it
+ ---
+ --- Progressive disclosure:
+----   1. Catalog (name + description) injected at startup for all valid skills
+----   2. Full SKILL.md body injected when a skill is loaded via the skill tool
++---   1. Name and description are a system message
++---   2. Full SKILL.md body is a system message after the skill is loaded
+ ---   3. scripts/ / references/ / assets/ are left on disk for on-demand reads
+ ---
+ --- Optional frontmatter (parsed but not required): license, compatibility,
+@@ -356,41 +356,30 @@ end
+ 
+ -- Rendering --
+ 
+---- Compact catalog for the system prompt (progressive disclosure step 1).
+---- Only name + description — never the full body.
+-function M.render_catalog()
++--- Name and description list. Empty when no skills exist. Its own system message.
++function M.catalog_text()
+ 	if #M.order == 0 then
+ 		return ""
+ 	end
+-	local lines = {
+-		"## Available Skills",
+-		"",
+-		"Skills follow the Agent Skills format (name + description below). "
+-			.. "Use the `skill` tool with action `load` and the skill name when relevant; "
+-			.. "that injects the full skill instructions into context.",
+-		"",
+-	}
++	local lines = { "Available skills. Load one with the skill tool.", "" }
+ 	for _, id in ipairs(M.order) do
+ 		local s = M.registry[id]
+ 		local status = s.loaded and " [loaded]" or ""
+-		table.insert(lines, string.format("- **%s**: %s%s", s.name, s.desc, status))
++		table.insert(lines, "- " .. s.name .. ": " .. s.desc .. status)
+ 	end
+ 	return table.concat(lines, "\n")
+ end
+ 
+---- Full markdown body of all loaded skills (progressive disclosure step 2).
+-function M.render_loaded()
+-	local parts = {}
++--- One string per loaded skill. Each becomes its own system message.
++function M.loaded_texts()
++	local out = {}
+ 	for _, id in ipairs(M.order) do
+ 		local s = M.registry[id]
+-		if s.loaded and s.content then
+-			table.insert(parts, "### Skill: " .. s.name .. "\n\n" .. s.content)
++		if s.loaded and s.content and s.content ~= "" then
++			table.insert(out, "Skill: " .. s.name .. "\n\n" .. s.content)
+ 		end
+ 	end
+-	if #parts == 0 then
+-		return ""
+-	end
+-	return table.concat(parts, "\n\n---\n\n")
++	return out
+ end
+ 
+ --- List skills for the tool response.
+diff --git a/lua/tai/tests/chat_test.lua b/lua/tai/tests/chat_test.lua
+new file mode 100644
+index 0000000..9cfbf0e
+--- /dev/null
++++ b/lua/tai/tests/chat_test.lua
+@@ -0,0 +1,93 @@
++-- Run: nvim --headless -u NONE --noplugin -c "set rtp+=." -c "luafile lua/tai/tests/chat_test.lua" -c "qa!"
++
++local passed, failed = 0, 0
++
++local function assert_eq(a, b, msg)
++	if a == b then
++		passed = passed + 1
++		print("  OK " .. msg)
++	else
++		failed = failed + 1
++		print("  FAIL " .. msg .. " exp=" .. vim.inspect(a) .. " got=" .. vim.inspect(b))
++	end
++end
++
++local function assert_true(v, msg)
++	if v then
++		passed = passed + 1
++		print("  OK " .. msg)
++	else
++		failed = failed + 1
++		print("  FAIL " .. msg)
++	end
++end
++
++package.loaded["tai.config"] = {
++	root = "/tmp/test-project",
++	provider = "mock",
++	model = "test",
++	use_tools = true,
++	stream = false,
++	rpm = 60,
++	context = { enabled = false },
++	get_allowed_commands = function()
++		return { ls = true }
++	end,
++}
++package.loaded["tai.log"] = {
++	debug = function() end,
++	info = function() end,
++	warning = function() end,
++	error = function() end,
++	set_level = function() end,
++	DEBUG = 0,
++}
++package.loaded["tai.agent"] = nil
++package.loaded["tai.tools"] = nil
++package.loaded["tai.tools.notes"] = nil
++
++local agent = require("tai.agent")
++local tools = require("tai.tools")
++local notes = require("tai.tools.notes")
++
++print("\n=== chat agent ===")
++local frame = agent.new_frame()
++assert_eq(agent.system_prompt, frame.history[1].content, "history starts with the chat prompt")
++assert_eq(1, #frame.history, "no extra history")
++assert_true(frame.system_prompt:find("one coding assistant", 1, true), "one agent")
++assert_true(frame.system_prompt:find("Do not guess paths", 1, true), "do not guess paths")
++assert_true(frame.system_prompt:find("Do the work", 1, true), "do the work")
++assert_true(frame.system_prompt:find("reply in text", 1, true), "reply in text")
++assert_true(not frame.system_prompt:find("Use the skill tool", 1, true), "skill load is not a standing bullet")
++assert_true(not frame.system_prompt:find("Use the mcp tool", 1, true), "mcp instruction is not in the chat prompt")
++assert_true(not frame.system_prompt:find("There is no other agent", 1, true), "no other-agent line")
++assert_true(not frame.system_prompt:find("No markdown", 1, true), "no style line")
++assert_true(not frame.system_prompt:find("Use only tools", 1, true), "no tool-list sentence")
++assert_true(not frame.system_prompt:find("Available Skills", 1, true), "no skill catalog in the prompt")
++assert_true(not frame.system_prompt:find("subtask", 1, true), "prompt does not mention subtask")
++assert_true(not frame.system_prompt:find("/tmp/test-project", 1, true), "prompt has no project path")
++for _, name in ipairs({ "read", "shell", "edit", "write", "notes" }) do
++	assert_true(vim.tbl_contains(frame.tools, name), "chat has " .. name)
++end
++assert_true(not vim.tbl_contains(frame.tools, "subtask"), "chat has no subtask")
++assert_true(tools.defs.subtask == nil, "subtask tool is gone")
++assert_true(tools.defs.read ~= nil, "read tool remains")
++
++local shown = agent.render_tools(frame.tools)
++assert_true(shown:find("read: open a file", 1, true) ~= nil, "tool list describes read")
++assert_true(not shown:find("subtask", 1, true), "tool list has no subtask")
++
++print("\n=== notes ===")
++notes.set_notes("")
++assert_eq("", notes.render_notes(), "empty notes are not injected")
++assert_true(notes.run({ action = "write", content = "hi" }):find("updated", 1, true) ~= nil, "write notes")
++assert_eq("hi", notes.get_notes(), "notes stored")
++assert_true(notes.render_notes():find("NOTES\nUse the notes tool to manage this.", 1, true) ~= nil, "notes intro")
++assert_true(notes.render_notes():find("hi", 1, true) ~= nil, "notes injected")
++assert_true(notes.run({ action = "append", content = "more" }):find("appended", 1, true) ~= nil, "append notes")
++assert_eq("hi\nmore", notes.get_notes(), "append joins")
++
++print(string.format("\n%d passed, %d failed", passed, failed))
++if failed &gt; 0 then
++	os.exit(1)
++end
+diff --git a/lua/tai/tests/nest_test.lua b/lua/tai/tests/nest_test.lua
+deleted file mode 100644
+index 3de8896..0000000
+--- a/lua/tai/tests/nest_test.lua
++++ /dev/null
+@@ -1,108 +0,0 @@
+--- nest_test.lua
+--- Run: nvim --headless -u NONE --noplugin -c "set rtp+=." -c "luafile lua/tai/tests/nest_test.lua" -c "qa!"
+-
+-local passed, failed = 0, 0
+-
+-local function assert_eq(a, b, msg)
+-	if a == b then
+-		passed = passed + 1
+-		print("  OK " .. msg)
+-	else
+-		failed = failed + 1
+-		print("  FAIL " .. msg .. " exp=" .. vim.inspect(a) .. " got=" .. vim.inspect(b))
+-	end
+-end
+-
+-package.loaded["tai.ui.nest"] = nil
+-local nest = require("tai.ui.nest")
+-
+-print("\n=== nest.prefix ===")
+-assert_eq("", nest.prefix(0), "depth 0")
+-assert_eq("", nest.prefix(nil), "nil depth")
+-assert_eq("    ", nest.prefix(1), "depth 1")
+-assert_eq("        ", nest.prefix(2), "depth 2")
+-
+-print("\n=== nest.apply worker text ===")
+-assert_eq("    hello", nest.apply("hello", 1, ""), "first line at depth 1")
+-assert_eq("    a\n    b", nest.apply("a\nb", 1, ""), "multiline at depth 1")
+-assert_eq("SUBTASK search\n    I found it", nest.apply("I found it", 1, "SUBTASK search"), "after SUBTASK header")
+-assert_eq("    SUBTASK run\n        I found", nest.apply("I found", 2, "    SUBTASK run"), "nested header then text")
+-assert_eq("    hel" .. "lo", nest.apply("lo", 1, "    hel"), "stream continuation")
+-assert_eq("    hello\n    world", nest.apply("\nworld", 1, "    hello"), "newline then next line")
+-assert_eq("    {{{" .. "\n    output\n    }}}", nest.apply("{{{\noutput\n}}}", 1, ""), "fold body indented")
+-assert_eq("    }}}\n    I found", nest.apply("I found", 1, "    }}}"), "text after fold close")
+-assert_eq("}}}\n    I found", nest.apply("I found", 1, "}}}"), "text after unindented fold close")
+-
+-print("\n=== nest.apply main after child ===")
+-assert_eq("    I found\nNext step", nest.apply("Next step", 0, "    I found"), "main after indented child")
+-assert_eq("hello there", nest.apply(" there", 0, "hello"), "main mid-line glue")
+-
+-print("\n=== nest.apply sequence (chat tree) ===")
+-local buf = ""
+-local function step(text, depth)
+-	local last = buf:match("([^\n]*)$") or ""
+-	local head = buf:sub(1, #buf - #last)
+-	buf = head .. nest.apply(text, depth, last)
+-end
+-step("SUBTASK search\n", 0)
+-step("I'll look around\n", 1)
+-step("shell: find . -name '*.lua'\n{{{\n", 1)
+-step("lua/tai/init.lua\n", 1)
+-step("}}}\n", 1)
+-step("Found init.lua\n", 1)
+-step("\n___ END _______________________________________________________________\n", 0)
+-step("SUBTASK summarize\n", 1)
+-step("It is the entrypoint\n", 2)
+-
+-local expect = table.concat({
+-	"SUBTASK search",
+-	"    I'll look around",
+-	"    shell: find . -name '*.lua'",
+-	"    {{{",
+-	"    lua/tai/init.lua",
+-	"    }}}",
+-	"    Found init.lua",
+-	"",
+-	"___ END _______________________________________________________________",
+-	"    SUBTASK summarize",
+-	"        It is the entrypoint",
+-	"",
+-}, "\n")
+-assert_eq(expect, buf, "full tree")
+-
+-print("\n=== nest.apply 3-level (sub-subtask) ===")
+-buf = ""
+--- Same calls as run_tools: header at parent depth, body at child depth.
+-step("SUBTASK search\n", 0) -- main → child
+-step("orient done\n", 1)
+-step("SUBTASK list lua/tai\n", 1) -- child → grandchild
+-step("shell: ls lua/tai\n{{{\n", 2)
+-step("agent.lua\nui\n", 2)
+-step("}}}\n", 2)
+-step("found: lua/tai/agent.lua\n", 2)
+-step("\n___ END _______________________________________________________________\n", 1)
+-step("SUBTASK read agent.lua\n", 2) -- grandchild → great-grandchild
+-step("main_tools is subtask only\n", 3)
+-
+-local expect3 = table.concat({
+-	"SUBTASK search",
+-	"    orient done",
+-	"    SUBTASK list lua/tai",
+-	"        shell: ls lua/tai",
+-	"        {{{",
+-	"        agent.lua",
+-	"        ui",
+-	"        }}}",
+-	"        found: lua/tai/agent.lua",
+-	"",
+-	"    ___ END _______________________________________________________________",
+-	"        SUBTASK read agent.lua",
+-	"            main_tools is subtask only",
+-	"",
+-}, "\n")
+-assert_eq(expect3, buf, "3-level tree")
+-
+-print(string.format("\n%d passed, %d failed", passed, failed))
+-if failed &gt; 0 then
+-	vim.cmd("cquit 1")
+-end
+diff --git a/lua/tai/tests/subtask_test.lua b/lua/tai/tests/subtask_test.lua
+deleted file mode 100644
+index 5b46aab..0000000
+--- a/lua/tai/tests/subtask_test.lua
++++ /dev/null
+@@ -1,225 +0,0 @@
+--- subtask_test.lua
+--- Run: nvim --headless -u NONE --noplugin -c "set rtp+=." -c "luafile lua/tai/tests/subtask_test.lua" -c "qa!"
+-
+-local passed, failed = 0, 0
+-
+-local function assert_eq(a, b, msg)
+-	if a == b then passed = passed + 1; print("  OK " .. msg)
+-	else failed = failed + 1; print("  FAIL " .. msg .. " exp=" .. vim.inspect(a) .. " got=" .. vim.inspect(b)) end
+-end
+-local function assert_true(v, msg)
+-	if v then passed = passed + 1; print("  OK " .. msg)
+-	else failed = failed + 1; print("  FAIL " .. msg) end
+-end
+-local function assert_match(pat, s, msg)
+-	if type(s) == "string" and s:find(pat) then passed = passed + 1; print("  OK " .. msg)
+-	else failed = failed + 1; print("  FAIL " .. msg .. " in: " .. tostring(s):sub(1, 200)) end
+-end
+-
+-package.loaded["tai.config"] = {
+-	root = "/tmp/test-project",
+-	provider = "mock",
+-	model = "test",
+-	use_tools = true,
+-	stream = false,
+-	rpm = 60,
+-	context = { enabled = false },
+-	get_allowed_commands = function() return { ls = true } end,
+-}
+-package.loaded["tai.log"] = {
+-	debug = function() end, info = function() end,
+-	warning = function() end, error = function() end, set_level = function() end, DEBUG = 0,
+-}
+-
+-package.loaded["tai.tools.subtask"] = nil
+-package.loaded["tai.tools"] = nil
+-package.loaded["tai.agent"] = nil
+-
+-local tools = require("tai.tools")
+-local agent = require("tai.agent")
+-local mem = require("tai.tools.subtask")
+-
+-print("\n=== subtask tool schema ===")
+-assert_true(tools.defs.subtask ~= nil, "subtask exists")
+-assert_true(tools.defs.todos == nil, "todos tool removed")
+-local p = tools.defs.subtask["function"].parameters
+-assert_true(vim.tbl_contains(p.required, "goal"), "goal required")
+-assert_true(p.properties.id == nil, "no todo id field")
+-assert_true(p.properties.system_prompt ~= nil, "system_prompt optional field")
+-
+-print("\n=== agent frames ===")
+-local main = agent.new_frame({ profile = "main" })
+-assert_eq("MAIN", main.label, "main label")
+-assert_true(not main.isolated, "main shares the user chat")
+-assert_true(vim.tbl_contains(main.tools, "subtask"), "main has subtask")
+-assert_true(vim.tbl_contains(main.tools, "notes"), "main has notes")
+-assert_true(not vim.tbl_contains(main.tools, "todos"), "main has no todos")
+-assert_true(not vim.tbl_contains(main.tools, "edit"), "main has no edit")
+-
+-local child = agent.new_frame({
+-	profile = "subtask",
+-	system_prompt = "You are a reviewer only.",
+-	tools = { "read", "shell", "subtask", "edit" },
+-	goal = "Review foo.lua exports",
+-})
+-assert_eq("SUBTASK", child.label, "subtask label")
+-assert_true(child.isolated, "child has a clean history")
+-assert_eq("Review foo.lua exports", child.goal, "child goal")
+-assert_eq(0, #child.steps, "child starts with no steps")
+-assert_true(vim.tbl_contains(child.tools, "subtask"), "child may nest subtask")
+-assert_true(not vim.tbl_contains(child.tools, "todos"), "child has no todos")
+-assert_eq(4, #child.tools, "explicit tools are not replaced by the default set")
+-assert_eq("Review foo.lua exports", child.history[2].content, "goal as user message")
+-
+-print("\n=== same_goal ===")
+-assert_true(mem.same_goal(
+-	"search for the term 'provider' in Makefile to identify configurations",
+-	"search for the term 'provider' in Makefile and return any matching lines"
+-), "same search restated")
+-assert_true(mem.same_goal("Read README.md", "read README.md"), "case/space only")
+-assert_true(not mem.same_goal(
+-	"list files in lua/tai",
+-	"grep provider in README.md"
+-), "different jobs")
+-
+-print("\n=== clean history ===")
+-local informed = agent.new_frame({
+-	profile = "subtask",
+-	tools = { "shell" },
+-	goal = "grep provider in README.md",
+-	steps = { { text = "list files", response = "README.md exists" } },
+-})
+-assert_eq("grep provider in README.md", informed.history[2].content, "history is only the goal")
+-assert_eq(2, #informed.history, "no extra history messages")
+-assert_true(not mem.render_memory(informed):match("grep provider"), "goal stays out of system state")
+-assert_match("list files", mem.render_memory(informed), "sibling steps are injected")
+-assert_match("README.md exists", mem.render_memory(informed), "step report is injected")
+-
+-print("\n=== tool_granted ===")
+-assert_true(agent.tool_granted({ "subtask", "notes" }, "subtask"), "granted name")
+-assert_true(agent.tool_granted({ "subtask", "notes" }, "notes"), "granted notes")
+-assert_true(not agent.tool_granted({ "subtask", "notes" }, "shell"), "ungranted shell")
+-assert_true(not agent.tool_granted({ "subtask", "notes" }, "read"), "ungranted read")
+-assert_true(not agent.tool_granted(nil, "shell"), "nil list")
+-assert_true(not agent.tool_granted({ "subtask" }, ""), "empty name")
+-assert_true(not agent.tool_granted({ "subtask" }, nil), "nil name")
+-
+-print("\n=== orchestrator prompt ===")
+-assert_true(main.system_prompt:find("cannot read, edit, or run commands", 1, true),
+-	"main cannot work itself")
+-assert_true(main.system_prompt:find("only reply to the user or call subtask", 1, true),
+-	"main only delegates")
+-assert_true(main.system_prompt:find("even if you cannot call them", 1, true),
+-	"main grants tools it cannot call")
+-assert_true(not main.system_prompt:find("List the project", 1, true),
+-	"main has no work guide")
+-local default_prompt = agent.new_frame({ profile = "subtask", goal = "Look" })
+-assert_true(default_prompt.system_prompt:find("even ones you cannot call", 1, true),
+-	"child may grant tools it cannot call")
+-
+-print("\n=== render_tools ===")
+-assert_eq("", agent.render_tools(nil), "nil list is empty")
+-assert_eq("", agent.render_tools({}), "empty list is empty")
+-local granted = agent.render_tools({ "subtask", "notes" })
+-assert_match("You may call only:", granted, "call header")
+-assert_match("%- subtask: spawn one smaller step", granted, "describes subtask")
+-assert_match("%- notes: shared pad", granted, "describes notes")
+-assert_match("before you spawn", granted, "notes is for briefing")
+-assert_match("including ones you cannot call:", granted, "grant header")
+-assert_match("%- shell: run a command", granted, "describes shell for granting")
+-assert_match("%- read: open a file", granted, "describes read for granting")
+-assert_true(not granted:find("Other tools are denied", 1, true), "no blanket deny")
+-local leaf_cat = agent.render_tools({ "read" })
+-assert_match("%- read: open a file", leaf_cat, "leaf describes granted")
+-assert_true(not leaf_cat:find("including ones you cannot call", 1, true), "leaf has no grant list")
+-assert_true(not leaf_cat:find("- shell:", 1, true), "leaf does not advertise shell")
+-
+-print("\n=== sanitize_subtask_tools ===")
+-local leaf = agent.sanitize_subtask_tools({ "read", "shell" })
+-assert_eq(2, #leaf, "keeps a valid list")
+-assert_true(not vim.tbl_contains(leaf, "subtask"), "does not add subtask")
+-
+-local nest = agent.sanitize_subtask_tools({ "read", "subtask" })
+-assert_true(vim.tbl_contains(nest, "subtask"), "keeps requested subtask")
+-
+-assert_true(vim.tbl_contains(agent.sanitize_subtask_tools({ "read", "nope" }), "read"), "drops unknown")
+-local fallback = agent.sanitize_subtask_tools({ "grep" })
+-assert_true(vim.tbl_contains(fallback, "subtask"), "unknown list uses coordinator default")
+-assert_true(not vim.tbl_contains(fallback, "read"), "default has no read")
+-assert_true(vim.tbl_contains(agent.sanitize_subtask_tools(nil), "subtask"), "nil uses coordinator default")
+-assert_true(not vim.tbl_contains(agent.sanitize_subtask_tools(nil), "read"), "nil default has no read")
+-
+-local read_only = agent.new_frame({
+-	profile = "subtask",
+-	tools = { "read" },
+-	goal = "Read README.md lines 1:20",
+-})
+-assert_eq("read", read_only.tools[1], "read-only child is a leaf")
+-assert_true(not vim.tbl_contains(read_only.tools, "subtask"), "leaf does not nest")
+-
+-local default_child = agent.new_frame({ profile = "subtask", goal = "Look around" })
+-assert_true(vim.tbl_contains(default_child.tools, "subtask"), "default child may nest")
+-assert_true(not vim.tbl_contains(default_child.tools, "read"), "default child has no read")
+-assert_true(not vim.tbl_contains(default_child.tools, "shell"), "default child has no shell")
+-
+-print("\n=== live context ===")
+-assert_eq("", mem.render_memory({ goal = "Ship the harness change" }), "no fence without skills or steps")
+-assert_true(not mem.render_memory({ goal = "Ship the harness change" }):match("Ship the"), "goal not injected")
+-local stepped = mem.render_memory({
+-	steps = { { text = "list lua/tai", response = "found context.lua" } },
+-})
+-assert_match("LIVE CONTEXT", stepped, "steps open a live context fence")
+-assert_match("list lua/tai", stepped, "step text")
+-assert_match("found context%.lua", stepped, "step response")
+-
+-local payload = mem.format_complete("ok", "looked around", { goal = "Read agent.lua" })
+-assert_match("status: ok", payload, "format_complete ok")
+-assert_match("step: Read agent%.lua", payload, "format_complete step")
+-assert_match("report:", payload, "format_complete report")
+-assert_match("looked around", payload, "format_complete findings")
+-
+-local errp = mem.format_complete("error", "ERROR [429 Too Many Requests]: rate limited", { goal = "Read agent.lua" })
+-assert_match("status: error", errp, "format_complete error status")
+-assert_match("error: ERROR %[429", errp, "format_complete keeps 429")
+-
+-print("\n=== handoff ===")
+-local short_out = mem.outcome_for({ tool_outputs = { "README.md\nAGENTS.md" } }, "")
+-assert_match("README.md", short_out, "empty reply forwards tool output")
+-assert_match("AGENTS.md", short_out, "forwards full tool output")
+-
+-local long_body = string.rep("x", 2000)
+-local no_text = mem.outcome_for({ tool_outputs = { long_body } }, "")
+-assert_true(#no_text == 2000, "tool output is not sliced")
+-
+-local said = mem.outcome_for({ tool_outputs = { "README.md" } }, "I'll look around")
+-assert_match("README.md", said, "weak intent yields the tool result")
+-assert_true(not said:match("I'll look around"), "does not hand off a promise")
+-local fact = mem.outcome_for({ tool_outputs = { "ignored" } }, "found: lua/tai/context.lua")
+-assert_match("found: lua/tai/context.lua", fact, "keeps a real report")
+-
+-print("\n=== build_request_tools ===")
+-local common = require("tai.provider_common")
+-local built = common.build_request_tools("chat_completions", { "subtask", "notes" })
+-assert_eq(2, #built, "only granted tools")
+-assert_eq("subtask", built[1]["function"].name, "first is subtask")
+-assert_eq("notes", built[2]["function"].name, "second is notes")
+-assert_eq(0, #common.build_request_tools("chat_completions", nil), "nil list is empty")
+-local unknown = common.build_request_tools("chat_completions", { "nope", "shell" })
+-assert_eq(1, #unknown, "drops unknown")
+-assert_eq("shell", unknown[1]["function"].name, "keeps known")
+-
+-print("\n=== notes ===")
+-mem.set_notes("")
+-assert_eq("", mem.render_notes(), "empty notes skip injection")
+-assert_match("updated", mem.run_notes({ action = "write", content = "hi" }), "write notes")
+-assert_eq("hi", mem.get_notes(), "notes stored globally")
+-assert_match("NOTES", mem.render_notes(), "fenced notes block")
+-assert_match("hi", mem.render_notes(), "notes body injected")
+-assert_true(not mem.render_memory({ goal = "x" }):match("hi"), "notes stay out of SHARED NOTES fence")
+-assert_match("appended", mem.run_notes({ action = "append", content = "more" }), "append notes")
+-assert_eq("hi\nmore", mem.get_notes(), "append joins globally")
+-mem.set_notes("")
+-assert_eq("", mem.get_notes(), "set_notes clears")
+-
+-print(string.format("\n%d passed, %d failed", passed, failed))
+-if failed &gt; 0 then os.exit(1) end
+diff --git a/lua/tai/tools.lua b/lua/tai/tools.lua
+index 5a63f32..c27e876 100644
+--- a/lua/tai/tools.lua
++++ b/lua/tai/tools.lua
+@@ -4,7 +4,7 @@ local M = {}
+ local tools_io = require("tai.tools.io")
+ local tools_shell = require("tai.tools.shell")
+ local tools_edit = require("tai.tools.edit")
+-local tools_subtask = require("tai.tools.subtask")
++local tools_notes = require("tai.tools.notes")
+ local tools_skill = require("tai.tools.skill")
+ local tools_mcp = require("tai.tools.mcp")
+ 
+@@ -14,17 +14,13 @@ M.limit_output = tools_io.limit_output
+ M.unsafe_command = tools_shell.unsafe_command
+ M.exec_command = tools_shell.exec_command
+ M.edit = tools_edit.edit
+-M.write = tools_subtask.write
+-M.image_data_url = tools_subtask.image_data_url
++M.write = tools_io.write
++M.image_data_url = tools_io.image_data_url
+ 
+--- Re-export helper functions
+-M.format_notes = tools_subtask.format_notes
+-M.get_notes = tools_subtask.get_notes
+-M.set_notes = tools_subtask.set_notes
+-M.render_notes = tools_subtask.render_notes
+-M.render_memory = tools_subtask.render_memory
+-M.format_complete = tools_subtask.format_complete
+-M.run_notes = tools_subtask.run_notes
++M.get_notes = tools_notes.get_notes
++M.set_notes = tools_notes.set_notes
++M.render_notes = tools_notes.render_notes
++M.run_notes = tools_notes.run
+ M.run_skill = tools_skill.run
+ M.run_mcp = tools_mcp.run
+ 
+@@ -75,47 +71,6 @@ M.defs = {
+ 			}
+ 		}
+ 	},
+-	subtask = {
+-		type = "function",
+-		["function"] = {
+-			name = "subtask",
+-			description =
+-			"Spawn an agent for one smaller next step, not the whole Goal. "
+-				.. "The child starts empty: it sees only this goal, NOTES, and its own previous steps. "
+-				.. "`goal` must be a self-contained brief (paths, names, what fact to return). "
+-				.. "One tool call per turn.",
+-			parameters = {
+-				type = "object",
+-				properties = {
+-					goal = {
+-						type = "string",
+-						description =
+-						"The child's only briefing besides NOTES. "
+-							.. "One action + one target, narrower than the current Goal. "
+-							.. "Include every path, name, and constraint. "
+-							.. "Say what fact to return (name, path, yes/no). "
+-							.. "Do not ask the child to return code or dumps.",
+-					},
+-					tools = {
+-						type = "array",
+-						items = { type = "string" },
+-						description =
+-						"Tools the child needs for its goal, not a copy of yours. "
+-							.. "You may grant tools you cannot call. "
+-							.. "Example: [\"shell\"] to grep, [\"read\"] to open a file. "
+-							.. "If the child still needs more than one shot, also pass \"subtask\". "
+-							.. "Omit for a coordinator (subtask+notes only).",
+-					},
+-					system_prompt = {
+-						type = "string",
+-						description = "Optional custom system prompt for the child.",
+-					},
+-				},
+-				additionalProperties = false,
+-				required = { "goal" },
+-			},
+-		},
+-	},
+ 	send_image = {
+ 		type = "function",
+ 		["function"] = {
+diff --git a/lua/tai/tools/io.lua b/lua/tai/tools/io.lua
+index d3fb8b8..1868029 100644
+--- a/lua/tai/tools/io.lua
++++ b/lua/tai/tools/io.lua
+@@ -190,4 +190,57 @@ end
+ 
+ M.is_binary_file = is_binary_file
+ 
++function M.write(file, content)
++	log.debug("Running write_file for: " .. file)
++	if file:sub(1, 1) == "/" then
++		return "Paths cannot start from root (/). Use relative."
++	end
++	local dir = vim.fn.fnamemodify(file, ":p:h")
++	if dir and dir ~= "" and dir ~= "." and vim.fn.isdirectory(dir) == 0 then
++		if vim.fn.mkdir(dir, "p") == -1 then
++			return "[sys] Error: Could not create directory: " .. dir
++		end
++	end
++	local f = io.open(file, "w")
++	if not f then
++		return "Error: Could not open file for writing: " .. file
++	end
++	f:write(content)
++	f:close()
++	return "File created: " .. file
++end
++
++function M.image_data_url(image_path)
++	if vim.fn.filereadable(image_path) ~= 1 then
++		return nil, "Image file not found: " .. image_path
++	end
++	local ext = image_path:match("%.(%w+)$")
++	if not ext then
++		return nil, "File has no extension, cannot determine image type"
++	end
++	local mime_types = {
++		png = "image/png",
++		jpg = "image/jpeg",
++		jpeg = "image/jpeg",
++		gif = "image/gif",
++		webp = "image/webp",
++		bmp = "image/bmp",
++	}
++	local mime = mime_types[ext:lower()]
++	if not mime then
++		return nil, "Unsupported image format: " .. ext
++	end
++	local cmd = string.format("base64 -i '%s' | tr -d '\n'", image_path:gsub("'", "'\\''"))
++	local handle = io.popen(cmd, "r")
++	if not handle then
++		return nil, "Failed to read image file"
++	end
++	local base64_content = handle:read("*a")
++	handle:close()
++	if not base64_content or #base64_content == 0 then
++		return nil, "Failed to encode image to base64"
++	end
++	return "data:" .. mime .. ";base64," .. base64_content, nil
++end
++
+ return M
+diff --git a/lua/tai/tools/notes.lua b/lua/tai/tools/notes.lua
+new file mode 100644
+index 0000000..d3dbd40
+--- /dev/null
++++ b/lua/tai/tools/notes.lua
+@@ -0,0 +1,53 @@
++local M = {}
++
++local notes_text = ""
++
++function M.get_notes()
++	return notes_text
++end
++
++function M.set_notes(text)
++	if text == nil or text == vim.NIL then
++		notes_text = ""
++		return
++	end
++	notes_text = tostring(text)
++end
++
++function M.render_notes()
++	if notes_text == "" then
++		return ""
++	end
++	local notes = notes_text
++	local max_chars = 6000
++	if #notes &gt; max_chars then
++		local half = math.floor(max_chars / 2)
++		notes = notes:sub(1, half) .. "\n\n[notes truncated]\n\n" .. notes:sub(#notes - half + 1)
++	end
++	return "NOTES\nUse the notes tool to manage this.\n\n" .. notes
++end
++
++function M.run(args)
++	args = args or {}
++	local action = args.action
++	if action == "write" then
++		if not args.content then
++			return "Error: 'content' is required for 'write'"
++		end
++		notes_text = args.content
++		return string.format("Notes updated (%d chars).", #args.content)
++	elseif action == "append" then
++		if not args.content then
++			return "Error: 'content' is required for 'append'"
++		end
++		if notes_text == "" then
++			notes_text = args.content
++		else
++			notes_text = notes_text .. "\n" .. args.content
++		end
++		return string.format("Notes appended (%d chars).", #args.content)
++	end
++	return "Error: unknown action '" .. tostring(action) .. "'"
++end
++
++return M
+diff --git a/lua/tai/tools/subtask.lua b/lua/tai/tools/subtask.lua
+deleted file mode 100644
+index afa12dd..0000000
+--- a/lua/tai/tools/subtask.lua
++++ /dev/null
+@@ -1,308 +0,0 @@
+-local M = {}
+-local log = require("tai.log")
+-local skills = require("tai.skills")
+-
+-function M.frame_goal(frame)
+-	frame = frame or {}
+-	if type(frame.goal) == "string" and frame.goal ~= "" then
+-		return frame.goal
+-	end
+-	for i = #(frame.history or {}), 1, -1 do
+-		local msg = frame.history[i]
+-		if msg and msg.role == "user" and type(msg.content) == "string" then
+-			return msg.content
+-		end
+-	end
+-	return ""
+-end
+-
+---- True when `child` is the same job as `parent` with different wording.
+-function M.same_goal(parent, child)
+-	local function core(s)
+-		s = tostring(s or ""):lower()
+-		s = s:gsub("[\"'`]", "")
+-		s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+-		s = s:gsub("%s+to%s+.*$", "")
+-		s = s:gsub("%s+and%s+.*$", "")
+-		s = s:gsub("%s+so%s+that%s+.*$", "")
+-		s = s:gsub("%s+so%s+.*$", "")
+-		s = s:gsub("%.$", "")
+-		return s
+-	end
+-	local a, b = core(parent), core(child)
+-	if a == "" or b == "" then
+-		return false
+-	end
+-	if a == b then
+-		return true
+-	end
+-	-- One restates the other with extra trailing purpose.
+-	if #a &gt;= 24 and #b &gt;= 24 and (a:find(b, 1, true) or b:find(a, 1, true)) then
+-		return true
+-	end
+-	return false
+-end
+-
+-local function trim_text(s)
+-	if s == nil or s == vim.NIL then
+-		return ""
+-	end
+-	if type(s) ~= "string" then
+-		s = tostring(s)
+-	end
+-	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+-end
+-
+-local function is_weak_reply(s)
+-	if s == "" then
+-		return true
+-	end
+-	if s:match("^I'll ") or s:match("^I will ") or s:match("^Let me ")
+-		or s:match("^Looking ") or s:match("^I am going") then
+-		return true
+-	end
+-	return false
+-end
+-
+-function M.outcome_for(frame, assistant_text)
+-	local assistant = trim_text(assistant_text)
+-	local parts = (frame and frame.tool_outputs) or {}
+-	local tools = #parts &gt; 0 and table.concat(parts, "\n\n") or ""
+-	if assistant ~= "" and not is_weak_reply(assistant) then
+-		return assistant
+-	end
+-	if tools ~= "" then
+-		return tools
+-	end
+-	if assistant ~= "" then
+-		return assistant
+-	end
+-	return "(no output)"
+-end
+-
+-function M.cap_report(text, max_chars)
+-	if type(text) ~= "string" or text == "" then
+-		return text
+-	end
+-	max_chars = max_chars or 600
+-	if #text &lt;= max_chars then
+-		return text
+-	end
+-	return text:sub(1, max_chars) .. "\n[truncated]"
+-end
+-
+---- Same-level previous steps (request-ephemeral). Goal stays the user message.
+-function M.format_progress(frame)
+-	frame = frame or {}
+-	local steps = frame.steps or {}
+-	if #steps == 0 then
+-		return ""
+-	end
+-	local lines = { "Previous steps at this level:" }
+-	local start = 1
+-	if #steps &gt; 8 then
+-		start = #steps - 7
+-		table.insert(lines, "(earlier steps omitted)")
+-	end
+-	for i = start, #steps do
+-		local step = steps[i]
+-		table.insert(lines, string.format("%d. %s", i, step.text or ""))
+-		local resp = step.response
+-		if type(resp) == "string" and resp ~= "" then
+-			resp = M.cap_report(resp, 600)
+-			for line in (resp .. "\n"):gmatch("(.-)\n") do
+-				table.insert(lines, "   " .. line)
+-			end
+-		end
+-	end
+-	return table.concat(lines, "\n")
+-end
+-
+--- Shared notepad for the whole stack (main + every worker).
+-local notes_text = ""
+-
+-function M.get_notes()
+-	return notes_text
+-end
+-
+-function M.set_notes(text)
+-	if text == nil or text == vim.NIL then
+-		notes_text = ""
+-		return
+-	end
+-	notes_text = tostring(text)
+-end
+-
+---- Truncate notes for injection (head + tail).
+-function M.format_notes(notes, max_chars)
+-	notes = notes or ""
+-	if notes == "" then
+-		return ""
+-	end
+-	max_chars = max_chars or 6000
+-	if #notes &lt;= max_chars then
+-		return notes
+-	end
+-	local half = math.floor(max_chars / 2)
+-	return notes:sub(1, half)
+-		.. "\n\n[notes truncated]\n\n"
+-		.. notes:sub(#notes - half + 1)
+-end
+-
+---- Shared notes block injected into every request (never stored in history).
+-function M.render_notes()
+-	local notes = M.format_notes(notes_text)
+-	if notes == "" then
+-		return ""
+-	end
+-	return table.concat({
+-		"========== NOTES ==========",
+-		"",
+-		notes,
+-		"",
+-		"========== END NOTES ==========",
+-	}, "\n")
+-end
+-
+---- Live context injected into the system prompt each request (never stored in history).
+---- Isolated workers have no chat history; this is how they see sibling step reports.
+-function M.render_memory(frame)
+-	frame = frame or {}
+-	local parts = {}
+-	local progress = M.format_progress(frame)
+-	if progress ~= "" then
+-		table.insert(parts, progress)
+-	end
+-	local loaded = skills.render_loaded()
+-	if loaded ~= "" then
+-		table.insert(parts, "Loaded skills:\n" .. loaded)
+-	end
+-	if #parts == 0 then
+-		return ""
+-	end
+-	return table.concat({
+-		"========== LIVE CONTEXT ==========",
+-		"",
+-		table.concat(parts, "\n\n"),
+-		"",
+-		"========== END LIVE CONTEXT ==========",
+-	}, "\n")
+-end
+-
+-local function is_error_text(s)
+-	return type(s) == "string" and (s:match("^ERROR ") or s:match("^status: error"))
+-end
+-
+---- Payload returned to parent when a worker finishes.
+-function M.format_complete(status, summary, frame)
+-	local outcome = summary or M.outcome_for(frame, nil)
+-	local step = frame and frame.goal or "?"
+-	if status == "error" or is_error_text(outcome) then
+-		return table.concat({
+-			"status: error",
+-			"step: " .. step,
+-			"error: " .. outcome,
+-		}, "\n")
+-	end
+-	return table.concat({
+-		"status: ok",
+-		"step: " .. step,
+-		"",
+-		"report:",
+-		outcome,
+-	}, "\n")
+-end
+-
+---- @param args table
+-function M.run_notes(args)
+-	local action = args.action
+-	if action == "write" then
+-		if not args.content then
+-			return "Error: 'content' is required for 'write'"
+-		end
+-		notes_text = args.content
+-		return string.format("Notes updated (%d chars).", #args.content)
+-	elseif action == "append" then
+-		if not args.content then
+-			return "Error: 'content' is required for 'append'"
+-		end
+-		if notes_text == "" then
+-			notes_text = args.content
+-		else
+-			notes_text = notes_text .. "\n" .. args.content
+-		end
+-		return string.format("Notes appended (%d chars).", #args.content)
+-	end
+-	return "Error: unknown action '" .. tostring(action) .. "'"
+-end
+-
+--- Add write function
+-function M.write(file, content)
+-	log.debug("Running write_file for: " .. file)
+-
+-	if file:sub(1, 1) == "/" then
+-		return "Paths cannot start from root (/). Use relative."
+-	end
+-
+-	-- Ensure parent directory exists
+-	local dir = vim.fn.fnamemodify(file, ":p:h")
+-	if dir and dir ~= "" and dir ~= "." and vim.fn.isdirectory(dir) == 0 then
+-		local mkdir_result = vim.fn.mkdir(dir, "p")
+-		if mkdir_result == -1 then
+-			return "[sys] Error: Could not create directory: " .. dir
+-		end
+-	end
+-
+-	-- Write content to file
+-	local f = io.open(file, "w")
+-	if not f then
+-		return "Error: Could not open file for writing: " .. file
+-	end
+-	f:write(content)
+-	f:close()
+-
+-	return "File created: " .. file
+-end
+-
+--- Add image_data_url function
+-function M.image_data_url(image_path)
+-	-- Check if file exists
+-	if vim.fn.filereadable(image_path) ~= 1 then
+-		return nil, "Image file not found: " .. image_path
+-	end
+-
+-	-- Detect MIME type from extension
+-	local ext = image_path:match("%.(%w+)$")
+-	if not ext then
+-		return nil, "File has no extension, cannot determine image type"
+-	end
+-	local mime_types = {
+-		png = "image/png",
+-		jpg = "image/jpeg",
+-		jpeg = "image/jpeg",
+-		gif = "image/gif",
+-		webp = "image/webp",
+-		bmp = "image/bmp",
+-	}
+-	local mime = mime_types[ext:lower()]
+-	if not mime then
+-		return nil, "Unsupported image format: " .. ext .. ". Supported formats: png, jpg, jpeg, gif, webp, bmp."
+-	end
+-
+-	-- Read file and encode to base64 using curl
+-	local cmd = string.format("base64 -i '%s' | tr -d '\n'", image_path)
+-	local handle = io.popen(cmd, "r")
+-	if not handle then
+-		return nil, "Failed to read image file"
+-	end
+-	local base64_content = handle:read("*a")
+-	handle:close()
+-
+-	if not base64_content or #base64_content == 0 then
+-		return nil, "Failed to encode image to base64"
+-	end
+-
+-	return "data:" .. mime .. ";base64," .. base64_content, nil
+-end
+-
+-return M
+diff --git a/lua/tai/ui/core.lua b/lua/tai/ui/core.lua
+index 34e26cd..332f426 100644
+--- a/lua/tai/ui/core.lua
++++ b/lua/tai/ui/core.lua
+@@ -7,10 +7,10 @@ local context = require("tai.context")
+ local tools_io = require("tai.tools.io")
+ local tools_shell = require("tai.tools.shell")
+ local tools_edit = require("tai.tools.edit")
+-local tools_subtask = require("tai.tools.subtask")
++local tools_notes = require("tai.tools.notes")
+ local tools_skill = require("tai.tools.skill")
+ local tools_mcp = require("tai.tools.mcp")
+-local nest = require("tai.ui.nest")
++local skills = require("tai.skills")
+ local mcp = require("tai.mcp")
+ 
+ if not config.provider then
+@@ -25,8 +25,7 @@ local input_win
+ local bufname_prefix = "tai-chat"
+ local input_bufname = "tai-chat-input"
+ 
+--- Agent stack: main frame at [1], optional subtask on top
+-local stack = { agent.new_frame() }
++local chat = agent.new_frame()
+ 
+ local hard_stop = false
+ local pending_tools = nil
+@@ -37,31 +36,7 @@ local inline_epoch = 0
+ -- True while an inline request owns current_state. Stop must not clear a planner request.
+ local inline_state = false
+ 
+-local function top()
+-	return stack[#stack]
+-end
+-
+-local function is_worker()
+-	return #stack &gt; 1
+-end
+-
+--- Nesting: MAIN is 0, first subtask is 1, its child is 2, …
+-local function nest_depth(frame)
+-	if frame and frame.depth and frame.depth &gt; 0 then
+-		return frame.depth
+-	end
+-	return math.max(0, #stack - 1)
+-end
+-
+-local function nest_label(frame)
+-	local d = nest_depth(frame)
+-	if d &lt; 1 then
+-		return "MAIN"
+-	end
+-	return string.format("SUBTASK %d", d)
+-end
+-
+--- Keep collapsed fold text aligned with the subtask indent.
++-- Keep collapsed fold text readable.
+ -- Regular leading spaces are stripped from foldtext; use NBSP.
+ _G.TaiChatFoldText = function()
+ 	local line = vim.fn.getline(vim.v.foldstart)
+@@ -117,12 +92,12 @@ local function refresh_and_close_folds()
+ 	end)
+ end
+ 
+-local function append_output(label, body, depth)
++local function append_output(label, body)
+ 	if label and label ~= "" then
+-		M.append(label .. "\n", depth)
++		M.append(label .. "\n")
+ 	end
+ 	if body and body ~= "" then
+-		M.append("{{{\n" .. body .. "\n}}}\n", depth)
++		M.append("{{{\n" .. body .. "\n}}}\n")
+ 		refresh_and_close_folds()
+ 	end
+ end
+@@ -150,44 +125,29 @@ local function format_edit_fold(old_text, new_text, result)
+ 	return table.concat(parts, "\n")
+ end
+ 
+-local function worker_history(frame)
+-	local goal = tools_subtask.frame_goal(frame)
+-	local hist = { { role = "system", content = frame.system_prompt or "" } }
+-	if goal ~= "" then
+-		table.insert(hist, { role = "user", content = goal })
+-	end
+-	return hist
+-end
+-
+ local function prepare_messages(frame)
+-	-- Isolated workers always start from scratch: system + goal only.
+-	local msgs = frame.isolated and worker_history(frame) or vim.deepcopy(frame.history)
+-	if msgs[1] and msgs[1].role == "system" then
+-		local parts = { frame.system_prompt }
+-		local tool_section = agent.render_tools(frame.tools)
+-		if tool_section ~= "" then
+-			table.insert(parts, tool_section)
+-		end
+-		local notes = tools_subtask.render_notes()
+-		if notes ~= "" then
+-			table.insert(parts, notes)
+-		end
+-		if frame.isolated then
+-			local live = tools_subtask.render_memory(frame)
+-			if live ~= "" then
+-				table.insert(parts, live)
+-			end
+-		end
+-		local mcp_section = mcp.render_prompt_section()
+-		if mcp_section ~= "" then
+-			table.insert(parts, table.concat({
+-				"========== MCP ==========",
+-				mcp_section,
+-				"========== END MCP ==========",
+-			}, "\n"))
+-		end
+-		-- Single system message (providers that allow only one); never stored in history.
+-		msgs[1].content = table.concat(parts, "\n\n")
++	local msgs = vim.deepcopy(frame.history)
++	if not (msgs[1] and msgs[1].role == "system") then
++		return msgs
++	end
++	-- Extra system messages are request-only. They are not stored in history.
++	local extra = {}
++	local notes = tools_notes.render_notes()
++	if notes ~= "" then
++		table.insert(extra, { role = "system", content = notes })
++	end
++	local catalog = skills.catalog_text()
++	if catalog ~= "" then
++		table.insert(extra, { role = "system", content = catalog })
++	end
++	for _, text in ipairs(skills.loaded_texts()) do
++		table.insert(extra, { role = "system", content = text })
++	end
++	for _, text in ipairs(mcp.server_texts()) do
++		table.insert(extra, { role = "system", content = text })
++	end
++	for i, msg in ipairs(extra) do
++		table.insert(msgs, i + 1, msg)
+ 	end
+ 	return msgs
+ end
+@@ -199,7 +159,7 @@ local function frame_config(frame)
+ end
+ 
+ local function get_agent_ctx()
+-	local hist = top().history
++	local hist = chat.history
+ 	for i = #hist, 1, -1 do
+ 		local msg = hist[i]
+ 		if msg and type(msg.token_usage) == "number" then
+@@ -267,8 +227,8 @@ local function save_session()
+ 		return
+ 	end
+ 	local ok = context.save({
+-		stack = stack,
+-		notes = tools_subtask.get_notes(),
++		stack = { chat },
++		notes = tools_notes.get_notes(),
+ 		last_ctx = get_agent_ctx(),
+ 		chat_lines = get_chat_lines(),
+ 	}, config.context)
+@@ -346,23 +306,35 @@ function M.init()
+ 	update_input_name()
+ end
+ 
+-function M.append(content, depth)
++local function glue(text, last_line)
++	text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
++	last_line = last_line or ""
++	if text == "" then
++		return last_line
++	end
++	if last_line == "" or last_line:match("^%s*$") then
++		return text
++	end
++	if last_line:find("{{{", 1, true) or last_line:find("}}}", 1, true) then
++		return last_line .. "\n" .. text
++	end
++	return last_line .. text
++end
++
++function M.append(content)
+ 	if content == nil or content == vim.NIL then
+ 		return
+ 	end
+ 	if type(content) ~= "string" then
+ 		content = tostring(content)
+ 	end
+-	if depth == nil then
+-		depth = nest_depth(top())
+-	end
+ 	local function do_append()
+ 		if not M.buffer_nr or not vim.api.nvim_buf_is_valid(M.buffer_nr) then
+ 			return
+ 		end
+ 		local last = vim.api.nvim_buf_get_lines(M.buffer_nr, -2, -1, false)
+ 		local last_line = last and last[1] or ""
+-		local merged = nest.apply(content, depth, last_line)
++		local merged = glue(content, last_line)
+ 		local lines = vim.split(merged, "\n", { plain = true })
+ 		local line_num = vim.api.nvim_buf_line_count(M.buffer_nr)
+ 		if not last[1] then
+@@ -379,14 +351,12 @@ function M.append(content, depth)
+ end
+ 
+ function M.update_chat_name()
+-	local fr = top()
+-	local role = nest_label(fr)
+ 	local state_part = current_state or "idle"
+ 	local name
+ 	if config and config.provider and config.model then
+-		name = string.format("%s (%s/%s - %s) [%s]", bufname_prefix, config.provider, config.model, role, state_part)
++		name = string.format("%s (%s/%s) [%s]", bufname_prefix, config.provider, config.model, state_part)
+ 	else
+-		name = string.format("%s %s [%s]", bufname_prefix, role, state_part)
++		name = string.format("%s [%s]", bufname_prefix, state_part)
+ 	end
+ 	if M.buffer_nr and vim.api.nvim_buf_is_valid(M.buffer_nr) then
+ 		pcall(vim.api.nvim_buf_set_name, M.buffer_nr, name)
+@@ -523,102 +493,11 @@ local function run_live_shell(command, on_done, depth)
+ 	end))
+ end
+ 
+-local function stringify_tool_content(content)
+-	if content == nil or content == vim.NIL then
+-		return ""
+-	end
+-	if type(content) == "string" then
+-		return content
+-	end
+-	return vim.inspect(content)
+-end
+-
+-local function record_tool_output(frame, content)
+-	if not frame or not is_worker() then
+-		return
+-	end
+-	frame.tool_outputs = frame.tool_outputs or {}
+-	local text = stringify_tool_content(content)
+-	if text == "" then
+-		return
+-	end
+-	table.insert(frame.tool_outputs, text)
+-end
+-
+--- Worker is done: print reply at this indent, then pop and resume parent.
+-local function finish_oneshot(frame, assistant_text, status)
+-	if not frame or #stack &lt;= 1 then
+-		return false
+-	end
+-	if not status then
+-		if type(assistant_text) == "string" and assistant_text:match("^ERROR ") then
+-			status = "error"
+-		else
+-			status = "ok"
+-		end
+-	end
+-	local outcome = tools_subtask.outcome_for(frame, assistant_text)
+-	if not frame._printed_content and type(assistant_text) == "string" and assistant_text ~= "" then
+-		M.append("\n" .. assistant_text .. "\n", nest_depth(frame))
+-	end
+-	local close_depth = nest_depth(frame)
+-	if close_depth &gt; 0 then
+-		close_depth = close_depth - 1
+-	end
+-	add_sep("___ END ", close_depth)
+-	if top() == frame then
+-		table.remove(stack)
+-	end
+-	local report = tools_subtask.format_complete(status, outcome, frame)
+-	local parent = top()
+-	if parent then
+-		parent.steps = parent.steps or {}
+-		table.insert(parent.steps, {
+-			text = frame.goal or "",
+-			response = report,
+-			status = status,
+-		})
+-	end
+-	M.update_chat_name()
+-	update_input_name()
+-	maybe_auto_save()
+-	if frame.on_parent_resume then
+-		local resume = frame.on_parent_resume
+-		frame.on_parent_resume = nil
+-		resume(report)
+-		return true
+-	end
+-	-- Main keeps tool results in chat history. Isolated parents stay at goal-only.
+-	if parent and frame.parent_call_id and not parent.isolated then
+-		table.insert(parent.history, {
+-			role = "tool",
+-			name = "subtask",
+-			tool_call_id = frame.parent_call_id,
+-			content = report,
+-		})
+-	end
+-	return true
+-end
+-
+-local function after_tool_round(frame, stop)
++local function after_tool_round(stop)
+ 	maybe_auto_save()
+-	if hard_stop then
+-		if is_worker() then
+-			finish_oneshot(frame, "ERROR [stopped]: Stopped by user", "error")
+-		end
+-		return
+-	end
+-	if stop then
+-		return
+-	end
+-	-- Nested subtask sets continue_after_tools. Work tools end this worker.
+-	if is_worker() and not frame.continue_after_tools then
+-		finish_oneshot(frame, frame.last_assistant)
++	if hard_stop or stop then
+ 		return
+ 	end
+-	if frame.isolated then
+-		frame.history = worker_history(frame)
+-	end
+ 	M.continue()
+ end
+ 
+@@ -647,8 +526,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 	on_done = on_done or function() end
+ 	local stop = false
+ 	local history = frame.history
+-	local depth = nest_depth(frame)
+-	frame.continue_after_tools = false
++	local depth = nil
+ 
+ 	if type(tool_calls) == "table" and #tool_calls &gt; 1 then
+ 		for i = 2, #tool_calls do
+@@ -692,7 +570,6 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 		}
+ 
+ 		local function finish_one()
+-			record_tool_output(frame, res.content)
+ 			table.insert(history, res)
+ 			if stop then
+ 				on_done(true)
+@@ -707,8 +584,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 				granted = "(none)"
+ 			end
+ 			M.append("tool denied: " .. tostring(name) .. "\n", depth)
+-			res.content = "Tool `" .. tostring(name) .. "` is not granted. Granted: "
+-				.. granted .. ". Call subtask and pass the tool if a child needs it."
++			res.content = "Tool `" .. tostring(name) .. "` is not available. Available: " .. granted .. "."
+ 			finish_one()
+ 			return
+ 		end
+@@ -776,73 +652,14 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 				M.append("write: missing content\n", depth)
+ 				res.content = "missing content field"
+ 			else
+-				local out = tools_subtask.write(args.file, args.content)
++				local out = tools_io.write(args.file, args.content)
+ 				res.content = out
+ 				append_output("write: " .. args.file, out, depth)
+ 			end
+-		elseif name == "subtask" then
+-			local first_sub
+-			for j, c in ipairs(calls) do
+-				local fn = c["function"] or {}
+-				if fn.name == "subtask" then
+-					first_sub = j
+-					break
+-				end
+-			end
+-			local goal = args.goal or args.Goal or args.task
+-			if type(goal) == "number" then
+-				goal = tostring(goal)
+-			end
+-			if type(goal) == "string" then
+-				goal = goal:match("^%s*(.-)%s*$") or goal
+-			else
+-				goal = nil
+-			end
+-			local parent_goal = tools_subtask.frame_goal(frame)
+-			if first_sub and i ~= first_sub then
+-				M.append("subtask skipped: only one per turn\n", depth)
+-				res.content = "Only one subtask per turn. Wait for this step, then continue."
+-			elseif not goal or goal == "" then
+-				M.append("subtask failed: no goal\n", depth)
+-				res.content = "missing goal"
+-			elseif parent_goal ~= "" and tools_subtask.same_goal(parent_goal, goal) then
+-				M.append("subtask failed: goal copies the current Goal\n", depth)
+-				res.content = "goal must be a more specific next step, not a copy of the current Goal: "
+-					.. goal
+-			elseif #stack &gt;= (agent.MAX_DEPTH or 8) then
+-				M.append("subtask failed: max depth\n", depth)
+-				res.content = "max subtask depth reached"
+-			else
+-				local child_tools = agent.sanitize_subtask_tools(args.tools)
+-				local child_depth = #stack
+-				M.append("SUBTASK " .. goal .. "\n", depth)
+-				M.append("tools: " .. table.concat(child_tools, ", ") .. "\n", child_depth)
+-				local child = agent.new_frame({
+-					profile = "subtask",
+-					system_prompt = args.system_prompt,
+-					tools = child_tools,
+-					goal = goal,
+-					depth = child_depth,
+-					parent_call_id = call.id,
+-				})
+-				child.on_parent_resume = function(report)
+-					frame.continue_after_tools = true
+-					res.content = report
+-					finish_one()
+-				end
+-				table.insert(stack, child)
+-				M.update_chat_name()
+-				update_input_name()
+-				maybe_auto_save()
+-				M.continue()
+-				return
+-			end
+ 		elseif name == "notes" then
+-			local out = tools_subtask.run_notes(args)
++			local out = tools_notes.run(args)
+ 			res.content = out
+-			-- Notes is briefing, not work. Keep the worker so it can subtask next.
+-			frame.continue_after_tools = true
+-			local body = tools_subtask.get_notes()
++			local body = tools_notes.get_notes()
+ 			if body ~= "" then
+ 				append_output("notes: " .. (args.action or "?"), body, depth)
+ 			else
+@@ -874,7 +691,7 @@ local function run_tools(tool_calls, frame, start_index, on_done)
+ 				M.append("image: missing file\n", depth)
+ 				res.content = "Missing file field"
+ 			else
+-				local image_url, err = tools_subtask.image_data_url(args.file)
++				local image_url, err = tools_io.image_data_url(args.file)
+ 				if not image_url then
+ 					M.append("image: " .. args.file .. " failed: " .. err .. "\n", depth)
+ 					res.content = "Error: " .. err
+@@ -919,8 +736,7 @@ function M.send_input()
+ 			return
+ 		end
+ 
+-		local frame = top()
+-		local history = frame.history
++		local history = chat.history
+ 
+ 		if pending_tools and #pending_tools &gt; 0 then
+ 			local call = pending_tools[1]
+@@ -931,63 +747,44 @@ function M.send_input()
+ 				tool_call_id = call.id,
+ 			}
+ 			local response = input:lower():gsub("^%s*(.-)%s*$", "%1")
+-			local depth = nest_depth(frame)
+-			M.append(input .. "\n", depth)
++			M.append(input .. "\n")
+ 
+ 			local command = args.command
+ 			if response == "y" or response == "yes" then
+-				M.append("Confirmed...\n", depth)
+-				M.append("shell: " .. tostring(command) .. "\n{{{\n", depth)
++				M.append("Confirmed...\n")
++				M.append("shell: " .. tostring(command) .. "\n{{{\n")
+ 				run_live_shell(command, function(out)
+ 					res.content = tools_io.limit_output(out, "shell")
+-					M.append((out or "") .. "\n}}}\n", depth)
++					M.append((out or "") .. "\n}}}\n")
+ 					refresh_and_close_folds()
+-					record_tool_output(frame, res.content)
+ 					table.insert(history, res)
+ 					table.remove(pending_tools, 1)
+-					run_tools(pending_tools, frame, 1, function(stop)
+-						after_tool_round(frame, stop)
+-					end)
+-				end, depth)
++					run_tools(pending_tools, chat, 1, after_tool_round)
++				end)
+ 				return
+ 			elseif response == "s" or response == "stop" then
+-				M.append("Stopped\n", depth)
+-				M.append("shell stopped: " .. tostring(command) .. "\n", depth)
++				M.append("Stopped\n")
++				M.append("shell stopped: " .. tostring(command) .. "\n")
+ 				hard_stop = true
+ 				res.content = "User stopped execution."
+-				record_tool_output(frame, res.content)
+ 				table.insert(history, res)
+ 				table.remove(pending_tools, 1)
+-				if is_worker() then
+-					finish_oneshot(frame, "ERROR [stopped]: Stopped by user", "error")
+-				end
+ 				maybe_auto_save()
+ 				return
+ 			else
+-				M.append("shell declined: " .. tostring(command) .. "\n", depth)
++				M.append("shell declined: " .. tostring(command) .. "\n")
+ 				res.content = "User declined running this command: " .. input
+-				record_tool_output(frame, res.content)
+ 				table.insert(history, res)
+ 				table.remove(pending_tools, 1)
+-				run_tools(pending_tools, frame, 1, function(stop)
+-					after_tool_round(frame, stop)
+-				end)
++				run_tools(pending_tools, chat, 1, after_tool_round)
+ 				return
+ 			end
+-		else
+-			if not is_worker() then
+-				frame.goal = input
+-				frame.steps = {}
+-			end
+-			table.insert(history, { role = "user", content = input })
+-			add_sep("___ USER ")
+-			M.append(input .. "\n")
+ 		end
+ 
+-		add_sep("___ " .. nest_label(frame) .. " ")
+-		if frame.tools and #frame.tools &gt; 0 then
+-			M.append("tools: " .. table.concat(frame.tools, ", ") .. "\n", nest_depth(frame))
+-		end
++		table.insert(history, { role = "user", content = input })
++		add_sep("___ USER ")
++		M.append(input .. "\n")
++		add_sep("___ TAI ")
+ 		maybe_auto_save()
+ 		M.continue()
+ 		update_input_name()
+@@ -1065,8 +862,8 @@ end
+ 
+ function M.clear()
+ 	vim.api.nvim_buf_set_lines(M.buffer_nr, 0, -1, false, {})
+-	stack = { agent.new_frame({ profile = "main" }) }
+-	tools_subtask.set_notes("")
++	chat = agent.new_frame()
++	tools_notes.set_notes("")
+ 	pending_tools = nil
+ 	pcall(function()
+ 		providers_factory.cancel_pending_waits()
+@@ -1079,21 +876,15 @@ function M.clear()
+ end
+ 
+ function M.continue()
+-	local frame = top()
++	local frame = chat
+ 	local hist = frame.history
+ 	local cfg = frame_config(frame)
+ 	local msgs = prepare_messages(frame)
+-	local agent_label = nest_label(frame)
+-	local out_depth = nest_depth(frame)
+ 
+ 	current_state = "waiting"
+ 	update_input_name()
+ 
+-	local function on_idle_no_tools(content)
+-		if is_worker() then
+-			finish_oneshot(frame, content or "(no output)")
+-			return
+-		end
++	local function on_idle_no_tools()
+ 		current_state = "idle"
+ 		update_input_name()
+ 		maybe_auto_save()
+@@ -1102,28 +893,22 @@ function M.continue()
+ 	local function handle_tools(tool_calls)
+ 		current_state = "tools"
+ 		update_input_name()
+-		local ok, err = pcall(run_tools, tool_calls, frame, 1, function(stop)
+-			after_tool_round(frame, stop)
+-		end)
++		local ok, err = pcall(run_tools, tool_calls, frame, 1, after_tool_round)
+ 		if not ok then
+ 			log.error("[UI] run_tools failed: " .. tostring(err))
+-			M.append("tool error: " .. tostring(err) .. "\n", out_depth)
+-			if is_worker() then
+-				finish_oneshot(frame, "ERROR [tools]: " .. tostring(err), "error")
+-			else
+-				current_state = "idle"
+-				update_input_name()
+-			end
++			M.append("tool error: " .. tostring(err) .. "\n")
++			current_state = "idle"
++			update_input_name()
+ 		end
+ 	end
+ 
+ 	if config.stream then
+-		log.info(agent_label .. " streaming")
++		log.info("chat streaming")
+ 		provider.request_stream(cfg, msgs, function(chunk, err)
+ 			if err then
+ 				current_state = "idle"
+ 				update_input_name()
+-				M.append("ERROR: " .. err .. "\n", out_depth)
++				M.append("ERROR: " .. err .. "\n")
+ 				return
+ 			end
+ 			if type(chunk) ~= "table" then
+@@ -1132,11 +917,11 @@ function M.continue()
+ 			if chunk.reasoning and #chunk.reasoning &gt; 0 then
+ 				current_state = "thinking"
+ 				update_input_name()
+-				M.append(chunk.reasoning, out_depth)
++				M.append(chunk.reasoning)
+ 			end
+ 			if chunk.content and chunk.content ~= "" then
+ 				if type(chunk.content) == "string" then
+-					M.append(chunk.content, out_depth)
++					M.append(chunk.content)
+ 					frame._printed_content = true
+ 				end
+ 			end
+@@ -1144,22 +929,16 @@ function M.continue()
+ 			if err then
+ 				current_state = "idle"
+ 				update_input_name()
+-				M.append("ERROR: " .. err .. "\n", out_depth)
++				M.append("ERROR: " .. err .. "\n")
+ 				table.insert(hist, { role = "assistant", content = err })
+-				if is_worker() then
+-					finish_oneshot(frame, err, "error")
+-				end
+ 				return
+ 			end
+ 			if type(data) ~= "table" then
+ 				current_state = "idle"
+ 				update_input_name()
+ 				local msg = "ERROR [provider]: empty provider response"
+-				M.append(msg .. "\n", out_depth)
++				M.append(msg .. "\n")
+ 				table.insert(hist, { role = "assistant", content = msg })
+-				if is_worker() then
+-					finish_oneshot(frame, msg, "error")
+-				end
+ 				maybe_auto_save()
+ 				return
+ 			end
+@@ -1171,21 +950,17 @@ function M.continue()
+ 			table.insert(hist, response)
+ 			if data.content and type(data.content) == "string" and data.content ~= "" then
+ 				if not frame._printed_content then
+-					M.append(data.content .. "\n", out_depth)
++					M.append(data.content .. "\n")
+ 					frame._printed_content = true
+ 				else
+-					M.append("\n", out_depth)
++					M.append("\n")
+ 				end
+ 			end
+ 			if data.token_usage then
+ 				update_input_name()
+ 			end
+ 			if data.error then
+-				M.append("ERROR: " .. tostring(data.error) .. "\n", out_depth)
+-				if is_worker() then
+-					finish_oneshot(frame, "ERROR [provider]: " .. tostring(data.error), "error")
+-					return
+-				end
++				M.append("ERROR: " .. tostring(data.error) .. "\n")
+ 			end
+ 			if not data.tool_calls or #data.tool_calls == 0 then
+ 				on_idle_no_tools(data.content)
+@@ -1194,16 +969,13 @@ function M.continue()
+ 			handle_tools(data.tool_calls)
+ 		end)
+ 	else
+-		log.info(agent_label .. " request")
++		log.info("chat request")
+ 		provider.request(cfg, msgs, function(fields, err)
+ 			if err then
+ 				current_state = "idle"
+ 				update_input_name()
+-				M.append("ERROR: " .. err .. "\n", out_depth)
++				M.append("ERROR: " .. err .. "\n")
+ 				table.insert(hist, { role = "assistant", content = err })
+-				if is_worker() then
+-					finish_oneshot(frame, err, "error")
+-				end
+ 				maybe_auto_save()
+ 				return
+ 			end
+@@ -1211,11 +983,8 @@ function M.continue()
+ 				current_state = "idle"
+ 				update_input_name()
+ 				local msg = "ERROR [provider]: empty provider response"
+-				M.append(msg .. "\n", out_depth)
++				M.append(msg .. "\n")
+ 				table.insert(hist, { role = "assistant", content = msg })
+-				if is_worker() then
+-					finish_oneshot(frame, msg, "error")
+-				end
+ 				maybe_auto_save()
+ 				return
+ 			end
+@@ -1231,15 +1000,11 @@ function M.continue()
+ 				update_input_name()
+ 			end
+ 			if fields.error then
+-				M.append("ERROR: " .. tostring(fields.error) .. "\n", out_depth)
+-				if is_worker() then
+-					finish_oneshot(frame, "ERROR [provider]: " .. tostring(fields.error), "error")
+-					return
+-				end
++				M.append("ERROR: " .. tostring(fields.error) .. "\n")
+ 			end
+ 			if fields.content and fields.content ~= vim.NIL and fields.content ~= ""
+ 				and type(fields.content) == "string" then
+-				M.append(fields.content .. "\n", out_depth)
++				M.append(fields.content .. "\n")
+ 				frame._printed_content = true
+ 			end
+ 			if not fields.tool_calls or #fields.tool_calls == 0 then
+diff --git a/lua/tai/ui/nest.lua b/lua/tai/ui/nest.lua
+deleted file mode 100644
+index ec9db38..0000000
+--- a/lua/tai/ui/nest.lua
++++ /dev/null
+@@ -1,79 +0,0 @@
+--- Nesting indent for the chat tree (4 spaces per subtask depth).
+-local M = {}
+-
+-function M.prefix(depth)
+-	if type(depth) ~= "number" or depth &lt; 1 then
+-		return ""
+-	end
+-	return string.rep("    ", depth)
+-end
+-
+-local function is_blank(s)
+-	return not s or s == "" or s:match("^%s*$") ~= nil
+-end
+-
+--- Do not glue new text onto a header or fold marker.
+-local function must_break(line, pad)
+-	if is_blank(line) then
+-		return false
+-	end
+-	if line:match("^%s*SUBTASK ") or line:match("{{{") or line:match("}}}") then
+-		return true
+-	end
+-	if pad ~= "" and line:sub(1, #pad) ~= pad then
+-		return true
+-	end
+-	return false
+-end
+-
+---- Indent `text` as a continuation of `last_line` at `depth`.
+---- Returns the string that should replace `last_line` (may contain newlines).
+-function M.apply(text, depth, last_line)
+-	if text == nil then
+-		text = ""
+-	end
+-	if type(text) ~= "string" then
+-		text = tostring(text)
+-	end
+-	text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+-	last_line = last_line or ""
+-	local pad = M.prefix(depth)
+-
+-	if text == "" then
+-		return last_line
+-	end
+-
+-	if pad == "" then
+-		if is_blank(last_line) then
+-			return text
+-		end
+-		-- Main text after an indented child starts on a new line.
+-		if last_line:match("^%s") or must_break(last_line, pad) then
+-			return last_line .. "\n" .. text
+-		end
+-		return last_line .. text
+-	end
+-
+-	local break_now = must_break(last_line, pad)
+-	local head
+-	if is_blank(last_line) then
+-		head = ""
+-	elseif break_now then
+-		head = last_line .. "\n"
+-	else
+-		head = last_line
+-	end
+-
+-	local body = text:gsub("\n", "\n" .. pad)
+-	-- Leading newlines stay blank; do not turn them into indent-only lines.
+-	if (is_blank(last_line) or break_now) and text:sub(1, 1) ~= "\n" then
+-		body = pad .. body
+-	end
+-	-- Trailing newline should leave an empty last line, not a leftover pad.
+-	if text:sub(-1) == "\n" and body:sub(-#pad) == pad then
+-		body = body:sub(1, #body - #pad)
+-	end
+-	return head .. body
+-end
+-
+-return M
+diff --git a/www/index.html b/www/index.html
+index 113e438..a70d61a 100644
+--- a/www/index.html
++++ b/www/index.html
+@@ -23,40 +23,23 @@ AI coding agents directly to your editor.
+ 
+ &lt;b&gt;features&lt;/b&gt;
+ 
+-- subtask harness: main agent can implement or
+-  spawn children with clean history; only the
+-  final report (+ notes/todos) returns.
+-- live context: per-agent notes + todos injected
+-  into the system prompt every turn (not history).
+-- flexible subtasks: goal, tools, optional
+-  system_prompt and notes/todos seed.
++- one chat agent: it reads, edits, and runs
++  commands, then replies in the same chat.
++- notes: a short pad injected into the system
++  prompt every turn (not history).
+ - session persistence: auto-save/restore.
+ - file read/write, shell, image analysis.
+ - rate limiting (rpm/tpm).
+ - streaming and non-streaming modes.
+-- code folding (including whole subtasks).
++- code folding for tool output.
+ - provider-side tool pass-through.
+ - configurable shell command safety allowlist.
+ 
+ 
+-&lt;b&gt;harness&lt;/b&gt;
++&lt;b&gt;chat&lt;/b&gt;
+ 
+-  MAIN (edit/write + subtask)
+-    │
+-    ├── subtask(goal, tools, system_prompt?)
+-    │      {{{ fold, own history + notes
+-    │      final text reply
+-    │   ◄── summary + notes + todos
+-    │
+-    └── verify → answer user
+-
+-
+-&lt;subtask params&gt;
+-
+-- goal           required charter for the child
+-- tools          required tool allowlist
+-- system_prompt  optional persona/constraints
+-- notes, todos   optional seed memory
++one agent. the conversation is the history.
++it uses tools, then answers in text.
+ 
+ 
+ &lt;i&gt;providers&lt;/i&gt;
+@@ -84,9 +67,9 @@ AI coding agents directly to your editor.
+ - edit       search-and-replace (multi flag)
+ - write      create new files
+ - send_image send images for visual analysis
+-- subtask    spawn child agent (goal + tools)
+-- todos      add/update todos (auto-injected)
+-- notes      write/append shared notes (injected every turn)
++- notes      write/append a short pad (injected every turn)
++- skill      list, load, or unload a skill
++- mcp        status, connect, or call an MCP tool
+ 
+ 
+ &lt;b&gt;keybindings&lt;/b&gt;
+</pre>
