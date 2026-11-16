@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tai.nvim 63758fd</title>
+<meta name="color-scheme" content="light dark">
+<link rel=icon href=data:,>
+<style>pre{width:52ch;margin:2ch auto;white-space:pre-wrap}a{color:#ff00ff}</style>
+<pre>
+<a href=index.html>tai.nvim</a> / <b>commit</b>
+
+<a href=log.html>log</a> | <a href=tree.html>tree</a> | <a href=refs.html>refs</a>
+
+commit 63758fd
+parent <a href=commit-a061d6b.html>a061d6b</a> 
+author myr &lt;myr@terminal.pink&gt;
+date   2026-11-16T14:31:00-03:00
+
+    Point the forge referer at tai.nvim.
+
+<a href=tree-63758fd.html>tree</a>
+
+<b>diff</b>
+
+diff --git a/lua/tai/provider_common.lua b/lua/tai/provider_common.lua
+index bfbffe2..daacaa0 100644
+--- a/lua/tai/provider_common.lua
++++ b/lua/tai/provider_common.lua
+@@ -149,7 +149,7 @@ function M.make_http_call(url, api_key, body_json, on_complete)
+ 		"-D", hdr,
+ 		"-X", "POST", url,
+ 		"-H", "Authorization: Bearer " .. api_key,
+-		"-H", "HTTP-Referer: https://terminal.pink/tai/index.html",
++		"-H", "HTTP-Referer: https://terminal.pink/tai.nvim/index.html",
+ 		"-H", "X-Title: tai.nvim",
+ 		"-H", "Content-Type: application/json",
+ 		"--data-binary", "@" .. tmp,
+@@ -304,7 +304,7 @@ function M.make_streaming_http_call(url, api_key, body_json, on_chunk, on_comple
+ 		"-D", hdr,
+ 		"-X", "POST", url,
+ 		"-H", "Authorization: Bearer " .. api_key,
+-		"-H", "HTTP-Referer: https://terminal.pink/tai/index.html",
++		"-H", "HTTP-Referer: https://terminal.pink/tai.nvim/index.html",
+ 		"-H", "X-Title: tai.nvim",
+ 		"-H", "Content-Type: application/json",
+ 		"--data-binary", "@" .. tmp,
+</pre>
